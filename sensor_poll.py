@@ -145,7 +145,7 @@ def read_secondary_water_loop_temperature() -> dict[str, float]:
 async def read_opcua_nodes_once(
     client: Client,
     nodes: dict[str, dict[str, object]],
-) -> dict[str, float]:
+) -> dict[str, str]:
     """Read several OPC UA node values in one request."""
     read_params = ReadParameters()
     read_params.NodesToRead = []
@@ -170,22 +170,46 @@ async def read_opcua_nodes_once(
             continue
 
         raw_value = result.Value.Value
-        if nodes[sensor]["type"]=="float":
-            value = float(raw_value) * nodes[sensor]["scale"]
-            value = f"{value:.2f}"
-        else:
-            value = str(raw_value)
 
-        if value is None:
-            print(f"Skipping non-numeric OPC UA value for {sensor}: {raw_value!r}")
+        if raw_value is None:
+            print(f"Skipping empty OPC UA value for {sensor}")
+            continue
+
+        try:
+            sensor_type = str(nodes[sensor]["type"])
+
+            if sensor_type == "float":
+                scale = float(nodes[sensor].get("scale", 1.0))
+                value_float = float(raw_value) * scale
+
+                if not math.isfinite(value_float):
+                    print(
+                        f"Skipping non-finite OPC UA value for {sensor}: "
+                        f"{raw_value!r}"
+                    )
+                    continue
+
+                value = f"{value_float:.2f}"
+
+            elif sensor_type == "int":
+                value = str(int(raw_value))
+
+            else:
+                print(f"Unsupported OPC UA type for {sensor}: {sensor_type!r}")
+                continue
+
+        except (TypeError, ValueError) as exc:
+            print(
+                f"Skipping invalid OPC UA value for {sensor}: "
+                f"{raw_value!r} ({exc})"
+            )
             continue
 
         values[sensor] = value
 
     return values
 
-
-async def read_opcua_measurements() -> dict[str, float]:
+async def read_opcua_measurements() -> dict[str, str]:
     """Connect to the OPC UA server and read all configured nodes."""
     client = Client(url=ENDPOINT)
     client.application_uri = APPLICATION_URI
@@ -198,7 +222,7 @@ async def read_opcua_measurements() -> dict[str, float]:
         await client.disconnect()
 
 
-def post_measurement(sensor: str, value: float) -> None:
+def post_measurement(sensor: str, value: str) -> None:
     """
     Send one measurement to the monitor app.
 
@@ -240,13 +264,13 @@ def post_measurement(sensor: str, value: float) -> None:
         raise RuntimeError(f"Timeout while posting {sensor}") from exc
 
 
-def post_measurements(values: dict[str, float]) -> None:
+def post_measurements(values: dict[str, str]) -> None:
     """Send all measurements to the monitor app POST endpoint."""
     for sensor, value in values.items():
         post_measurement(sensor, value)
 
 
-def collect_measurements() -> dict[str, float]:
+def collect_measurements() -> dict[str, str]:
     """Read all configured data sources and return one measurement dictionary.
 
     The legacy HTTP temperature is still read. OPC UA values are then added.

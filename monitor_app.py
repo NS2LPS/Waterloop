@@ -8,6 +8,7 @@ from typing import Any, Optional
 import threading
 from contextlib import contextmanager
 from collections.abc import Iterator
+import numpy as np
 
 import plotly.graph_objects as go
 from fastapi import HTTPException, Request
@@ -569,6 +570,32 @@ def make_indicator_html(status: str) -> str:
         'border:1px solid rgba(0,0,0,0.25);"></div>'
     )
 
+def split_downsampled_points(
+    points: list[tuple[int, float]],
+    max_points: int = 2000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return downsampled timestamp and value arrays."""
+    if not points:
+        return np.array([], dtype=np.int64), np.array([], dtype=float)
+
+    data = np.asarray(points, dtype=float)
+    n_points = data.shape[0]
+
+    if n_points > max_points:
+        indices = np.linspace(
+            0,
+            n_points - 1,
+            num=max_points,
+            dtype=np.int64,
+        )
+        data = data[indices]
+
+    timestamps = data[:, 0].astype(np.int64)
+    values = data[:, 1]
+
+    return timestamps, values
+
+
 def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours: float) -> go.Figure:
     """Build a Plotly figure for one PLOTS entry."""
     now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
@@ -590,19 +617,19 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
         sensor_colors[sensor] = color
 
         points = points_by_sensor.get(sensor, [])
+        timestamps, y_values = split_downsampled_points(points, max_points=2000)
         x_values = [
-            datetime.fromtimestamp(timestamp, tz=LOCAL_TZ)
-            for timestamp, _ in points
+            datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ)
+            for timestamp in timestamps
         ]
-        y_values = [value for _, value in points]
-
+        
         figure.add_trace(
             go.Scatter(
                 x=x_values,
                 y=y_values,
-                mode="lines+markers",
+                mode="lines",
                 name=plot_config["legend"][index][language] if "legend" in plot_config else None,
-                line={"color": color},
+                line={"color": color, "shape": "linear"},
                 marker={"color": color},
             )
         )
