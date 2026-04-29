@@ -1,18 +1,24 @@
 from datetime import datetime
-import sqlite3
+import time
+import threading
 from pathlib import Path
 from urllib import request as urlrequest
 from urllib.error import URLError, HTTPError
 from zoneinfo import ZoneInfo
 from typing import Any, Optional
-import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from collections.abc import Iterator
-import numpy as np
+import re
 
+import numpy as np
 import plotly.graph_objects as go
+import mysql.connector
+from mysql.connector.connection import MySQLConnection
+from mysql.connector import Error as MySQLError
+
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from nicegui import ui, app
 
 # Sensors and signals
@@ -21,12 +27,68 @@ from sensors import SIGNAL_TABLE
 # Translation table
 from languages import translate
 
+
+# ---------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+LOCAL_TZ = ZoneInfo("Europe/Paris")
+ENV_FILE = BASE_DIR / ".env"
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables or .env.
+
+    Environment variables use the WATERLOOP_ prefix.
+
+    Example:
+        WATERLOOP_DB_HOST=127.0.0.1
+        WATERLOOP_DB_PORT=3306
+        WATERLOOP_DB_USER=waterloop
+        WATERLOOP_DB_PASSWORD=secret
+        WATERLOOP_DB_NAME=waterloop
+        WATERLOOP_API_TOKEN=secret-token
+        WATERLOOP_NTFY_TOPIC=my-topic
+    """
+
+    db_host: str = "127.0.0.1"
+    db_port: int = 3306
+    db_user: str = "waterloop"
+    db_password: str = ""
+    db_name: str = "waterloop"
+    create_database_if_needed: bool = True
+
+    monitored_data_retention_days: int = 180
+    alarms_retention_days: int = 365
+    archive_rollover_period_seconds: int = 6 * 3600
+    archive_batch_size: int = 10_000
+
+    api_token: Optional[str] = None
+
+    ntfy_server: str = "https://ntfy.sh"
+    ntfy_topic: Optional[str] = None
+    ntfy_priority: str = "urgent"
+
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE,
+        env_prefix="WATERLOOP_",
+        extra="ignore",
+    )
+
+    @field_validator("api_token", "ntfy_topic", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, value: object) -> object:
+        """Treat empty strings in .env as unset optional values."""
+        if value == "":
+            return None
+        return value
+
+
+settings = Settings()
+
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_FILE = BASE_DIR / "water_loop.db"
-LOCAL_TZ = ZoneInfo("Europe/Paris")
 
 # Optional API token.
 #
@@ -35,9 +97,7 @@ LOCAL_TZ = ZoneInfo("Europe/Paris")
 #
 #   X-API-Token: your-token-here
 #
-API_TOKEN: Optional[str] = None
-# API_TOKEN = "change-this-token"
-
+API_TOKEN = settings.api_token
 
 # Refresh periods in seconds.
 #
@@ -110,115 +170,333 @@ PLOTS = [
 #
 # With this configuration, notifications are sent to:
 #   https://ntfy.sh/water-loop-lab-alerts-8f4a92
-NTFY_SERVER = "https://ntfy.sh"
-NTFY_TOPIC: Optional[str] = None
-#NTFY_TOPIC = "lps-waterloop-8f4a92"
-
-# Notification priority used by ntfy.
-# Common values: "default", "high", "urgent"
-NTFY_PRIORITY = "urgent"
-
+NTFY_SERVER = settings.ntfy_server
+NTFY_TOPIC = settings.ntfy_topic
+NTFY_PRIORITY = settings.ntfy_priority
 
 
 # ---------------------------------------------------------------------
 # Database setup
 # ---------------------------------------------------------------------
+DATABASE_CONFIG = {
+    "host": settings.db_host,
+    "port": settings.db_port,
+    "user": settings.db_user,
+    "password": settings.db_password,
+    "database": settings.db_name,
+    "charset": "utf8mb4",
+    "collation": "utf8mb4_unicode_ci",
+}
+
+SERVER_DATABASE_CONFIG = {
+    key: value
+    for key, value in DATABASE_CONFIG.items()
+    if key != "database"
+}
+
+# ---------------------------------------------------------------------
+# Archive / retention settings
+# ---------------------------------------------------------------------
+MONITORED_DATA_LIVE_RETENTION_DAYS = settings.monitored_data_retention_days
+ALARMS_LIVE_RETENTION_DAYS = settings.alarms_retention_days
+ARCHIVE_ROLLOVER_PERIOD_SECONDS = settings.archive_rollover_period_seconds
+ARCHIVE_BATCH_SIZE = settings.archive_batch_size
+
+_archive_rollover_lock = threading.Lock()
+_last_archive_rollover_timestamp = 0
+
+def quote_mysql_identifier(identifier: str) -> str:
+    """Safely quote a MySQL identifier such as a database name."""
+    if not re.fullmatch(r"[A-Za-z0-9_]+", identifier):
+        raise RuntimeError(f"Unsafe MySQL identifier: {identifier!r}")
+    return f"`{identifier}`"
+
+
 @contextmanager
-def db_connection() -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(DATABASE_FILE, timeout=30.0)
+def db_connection() -> Iterator[MySQLConnection]:
+    """Open a MySQL connection and commit/rollback the transaction."""
+    connection = mysql.connector.connect(**DATABASE_CONFIG)
+    connection.autocommit = False
     try:
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA foreign_keys = ON")
         yield connection
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
+
+def create_database_if_needed() -> None:
+    """Create the MySQL database if it does not already exist.
+
+    Uses SERVER_DATABASE_CONFIG because DATABASE_CONFIG includes the database
+    name, and connecting to a database that does not exist would fail.
+    """
+    if not settings.create_database_if_needed:
+        return
+
+    quoted_database_name = quote_mysql_identifier(settings.db_name)
+
+    try:
+        connection = mysql.connector.connect(**SERVER_DATABASE_CONFIG)
+        try:
+            with closing(connection.cursor()) as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE DATABASE IF NOT EXISTS {quoted_database_name}
+                    CHARACTER SET utf8mb4
+                    COLLATE utf8mb4_unicode_ci
+                    """
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+    except MySQLError as exc:
+        raise RuntimeError(
+            f"Could not create or access MySQL database {settings.db_name!r}: {exc}"
+        ) from exc
+    
+
 def create_tables_if_needed() -> None:
-    """Create the SQLite database file, tables, and indexes if needed."""
-    DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Create the MySQL tables and indexes if needed."""
+    create_database_if_needed()
 
     with db_connection() as connection:
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 30000")
-
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS monitored_data (
-                timestamp INTEGER NOT NULL,
-                sensor TEXT NOT NULL,
-                value TEXT NOT NULL
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitored_data (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `timestamp` BIGINT NOT NULL,
+                    sensor VARCHAR(128) NOT NULL,
+                    value VARCHAR(255) NOT NULL,
+                    PRIMARY KEY (id),
+                    KEY idx_monitored_data_sensor_timestamp (sensor, `timestamp`),
+                    KEY idx_monitored_data_timestamp (`timestamp`)
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
             )
-            """
-        )
 
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS alarms (
-                timestamp INTEGER NOT NULL,
-                sensor TEXT NOT NULL,
-                value TEXT NOT NULL,
-                transition INTEGER NOT NULL,
-                acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1))
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alarms (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    `timestamp` BIGINT NOT NULL,
+                    sensor VARCHAR(128) NOT NULL,
+                    value VARCHAR(255) NOT NULL,
+                    transition INT NOT NULL,
+                    acknowledged TINYINT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id),
+                    KEY idx_alarms_sensor_timestamp (sensor, `timestamp`),
+                    KEY idx_alarms_timestamp (`timestamp`),
+                    CONSTRAINT chk_alarms_acknowledged
+                        CHECK (acknowledged IN (0, 1))
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
             )
-            """
-        )
 
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sensor_states (
-                sensor TEXT PRIMARY KEY,
-                last_state INTEGER NOT NULL,
-                last_timestamp INTEGER NOT NULL,
-                last_value TEXT NOT NULL
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sensor_states (
+                    sensor VARCHAR(128) NOT NULL,
+                    last_state INT NOT NULL,
+                    last_timestamp BIGINT NOT NULL,
+                    last_value VARCHAR(255) NOT NULL,
+                    PRIMARY KEY (sensor),
+                    KEY idx_sensor_states_last_timestamp (last_timestamp)
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
             )
-            """
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitored_data_archive (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    original_id BIGINT UNSIGNED NOT NULL,
+                    `timestamp` BIGINT NOT NULL,
+                    sensor VARCHAR(128) NOT NULL,
+                    value VARCHAR(255) NOT NULL,
+                    archived_at BIGINT NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uq_monitored_data_archive_original_id (original_id),
+                    KEY idx_monitored_data_archive_sensor_timestamp (sensor, `timestamp`),
+                    KEY idx_monitored_data_archive_timestamp (`timestamp`)
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alarms_archive (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                    original_id BIGINT UNSIGNED NOT NULL,
+                    `timestamp` BIGINT NOT NULL,
+                    sensor VARCHAR(128) NOT NULL,
+                    value VARCHAR(255) NOT NULL,
+                    transition INT NOT NULL,
+                    acknowledged TINYINT NOT NULL,
+                    archived_at BIGINT NOT NULL,
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uq_alarms_archive_original_id (original_id),
+                    KEY idx_alarms_archive_sensor_timestamp (sensor, `timestamp`),
+                    KEY idx_alarms_archive_timestamp (`timestamp`)
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+
+def archive_monitored_data_batch(cursor, cutoff_timestamp: int, archived_at: int, batch_size: int) -> int:
+    """Move one batch of old monitored_data rows into monitored_data_archive."""
+    cursor.execute(
+        """
+        SELECT id
+        FROM monitored_data
+        WHERE `timestamp` < %s
+        ORDER BY `timestamp`, id
+        LIMIT %s
+        FOR UPDATE
+        """,
+        (cutoff_timestamp, batch_size),
+    )
+    ids = [int(row[0]) for row in cursor.fetchall()]
+
+    if not ids:
+        return 0
+
+    placeholders = ",".join(["%s"] * len(ids))
+
+    cursor.execute(
+        f"""
+        INSERT INTO monitored_data_archive (original_id, `timestamp`, sensor, value, archived_at)
+        SELECT id, `timestamp`, sensor, value, %s
+        FROM monitored_data
+        WHERE id IN ({placeholders})
+        """,
+        [archived_at, *ids],
+    )
+
+    cursor.execute(
+        f"""
+        DELETE FROM monitored_data
+        WHERE id IN ({placeholders})
+        """,
+        ids,
+    )
+
+    return len(ids)
+
+
+def archive_alarms_batch(cursor, cutoff_timestamp: int, archived_at: int, batch_size: int) -> int:
+    """Move one batch of old alarms rows into alarms_archive."""
+    cursor.execute(
+        """
+        SELECT id
+        FROM alarms
+        WHERE `timestamp` < %s
+        ORDER BY `timestamp`, id
+        LIMIT %s
+        FOR UPDATE
+        """,
+        (cutoff_timestamp, batch_size),
+    )
+    ids = [int(row[0]) for row in cursor.fetchall()]
+
+    if not ids:
+        return 0
+
+    placeholders = ",".join(["%s"] * len(ids))
+
+    cursor.execute(
+        f"""
+        INSERT INTO alarms_archive (
+            original_id, `timestamp`, sensor, value, transition, acknowledged, archived_at
+        )
+        SELECT id, `timestamp`, sensor, value, transition, acknowledged, %s
+        FROM alarms
+        WHERE id IN ({placeholders})
+        """,
+        [archived_at, *ids],
+    )
+
+    cursor.execute(
+        f"""
+        DELETE FROM alarms
+        WHERE id IN ({placeholders})
+        """,
+        ids,
+    )
+
+    return len(ids)
+
+
+def archive_old_rows() -> None:
+    """Move old rows from growing live tables into archive tables."""
+    now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
+    monitored_data_cutoff = now_timestamp - MONITORED_DATA_LIVE_RETENTION_DAYS * 24 * 3600
+    alarms_cutoff = now_timestamp - ALARMS_LIVE_RETENTION_DAYS * 24 * 3600
+
+    with db_connection() as connection:
+        with closing(connection.cursor()) as cursor:
+            moved_monitored_data = archive_monitored_data_batch(
+                cursor=cursor,
+                cutoff_timestamp=monitored_data_cutoff,
+                archived_at=now_timestamp,
+                batch_size=ARCHIVE_BATCH_SIZE,
+            )
+            moved_alarms = archive_alarms_batch(
+                cursor=cursor,
+                cutoff_timestamp=alarms_cutoff,
+                archived_at=now_timestamp,
+                batch_size=ARCHIVE_BATCH_SIZE,
+            )
+
+    if moved_monitored_data or moved_alarms:
+        print(
+            "Archive rollover complete: "
+            f"monitored_data={moved_monitored_data}, "
+            f"alarms={moved_alarms}"
         )
 
-        # Optimized for queries such as:
-        #   SELECT ... FROM monitored_data
-        #   WHERE sensor = ? AND timestamp BETWEEN ? AND ?
-        #   ORDER BY timestamp;
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_monitored_data_sensor_timestamp
-            ON monitored_data (sensor, timestamp)
-            """
-        )
 
-        # Also useful when retrieving all sensor data in a time window.
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_monitored_data_timestamp
-            ON monitored_data (timestamp)
-            """
-        )
+def archive_old_rows_if_due(force: bool = False) -> None:
+    """Run archive rollover in a background thread if enough time has passed."""
+    global _last_archive_rollover_timestamp
 
-        # Optimized for alarm history queries over a time window, optionally
-        # restricted to a single sensor.
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_alarms_sensor_timestamp
-            ON alarms (sensor, timestamp)
-            """
-        )
+    now_timestamp = int(time.time())
 
-        # Also useful when retrieving all alarms in a time window, regardless
-        # of sensor, for dashboard-level alarm history views.
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_alarms_timestamp
-            ON alarms (timestamp)
-            """
-        )
+    if (
+        not force
+        and now_timestamp - _last_archive_rollover_timestamp < ARCHIVE_ROLLOVER_PERIOD_SECONDS
+    ):
+        return
 
-        # Useful if you later want to query recently updated sensor states.
-        connection.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_sensor_states_last_timestamp
-            ON sensor_states (last_timestamp)
-            """
-        )
+    if not _archive_rollover_lock.acquire(blocking=False):
+        return
+
+    def worker() -> None:
+        global _last_archive_rollover_timestamp
+
+        try:
+            archive_old_rows()
+            _last_archive_rollover_timestamp = int(time.time())
+        except Exception as exc:
+            print(f"Archive rollover failed: {exc}")
+        finally:
+            _archive_rollover_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 # ---------------------------------------------------------------------
@@ -282,75 +560,73 @@ def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int,
 
 
 def check_for_alarm(sensor_name: str, value_str: str, timestamp: int) -> None:
-    """Detect range transitions for known sensors and write alarm events.
-
-    The first reading for a known sensor initializes itscstate and does not 
-    create an alarm because there is no previous edge.
-
-    Transition values written to alarms:
-       1,2, ...: valid -> invalid, acknowledged = false
-       0       : invalid -> valid, acknowledged = true
-    """
+    """Detect range transitions for known sensors and write alarm events."""
     if sensor_name not in STATUS_LEDS:
         return
+
     try:
         sensor = SIGNAL_TABLE[sensor_name]
         value = sensor.value(value_str)
-        new_state:int = sensor.validate(value)
+        new_state: int = sensor.validate(value)
     except Exception as exc:
-        # Alarm bookkeeping should not make data ingestion fail.
         print(
-        f"Alarm bookkeeping failed for sensor={sensor_name!r}, "
-        f"value={value_str!r}, timestamp={timestamp!r}: {exc}"
+            f"Alarm bookkeeping failed for sensor={sensor_name!r}, "
+            f"value={value_str!r}, timestamp={timestamp!r}: {exc}"
         )
         return
-    
+
     transition: Optional[int] = None
+    acknowledged: Optional[int] = None
+
     try:
-        with db_connection() as connection:           
-            row = connection.execute(
-                """
-                SELECT last_state
-                FROM sensor_states
-                WHERE sensor = ?
-                """,
-                (sensor_name,),
-            ).fetchone()
-            previous_state = None if row is None else int(row[0])
-
-            if previous_state is not None and previous_state != new_state:
-                transition = new_state
-                acknowledged = 1 if new_state == 0 else 0
-
-            connection.execute(
-                """
-                INSERT INTO sensor_states (sensor, last_state, last_timestamp, last_value)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(sensor) DO UPDATE SET
-                    last_state = excluded.last_state,
-                    last_timestamp = excluded.last_timestamp,
-                    last_value = excluded.last_value
-                """,
-                (sensor_name, new_state, timestamp, value_str),
-            )
-
-            if transition is not None:
-                start_alarm_notification_thread(sensor_name, value_str, timestamp, transition)
-                connection.execute(
+        with db_connection() as connection:
+            with closing(connection.cursor()) as cursor:
+                cursor.execute(
                     """
-                    INSERT INTO alarms (timestamp, sensor, value, transition, acknowledged)
-                    VALUES (?, ?, ?, ?, ?)
+                    SELECT last_state
+                    FROM sensor_states
+                    WHERE sensor = %s
+                    FOR UPDATE
                     """,
-                    (timestamp, sensor_name, value_str, transition, acknowledged),
+                    (sensor_name,),
                 )
-    except sqlite3.Error as exc:
-        # Alarm bookkeeping should not make data ingestion fail.
+                row = cursor.fetchone()
+                previous_state = None if row is None else int(row[0])
+
+                if previous_state is not None and previous_state != new_state:
+                    transition = new_state
+                    acknowledged = 1 if new_state == 0 else 0
+
+                cursor.execute(
+                    """
+                    INSERT INTO sensor_states (sensor, last_state, last_timestamp, last_value)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        last_state = VALUES(last_state),
+                        last_timestamp = VALUES(last_timestamp),
+                        last_value = VALUES(last_value)
+                    """,
+                    (sensor_name, new_state, timestamp, value_str),
+                )
+
+                if transition is not None and acknowledged is not None:
+                    cursor.execute(
+                        """
+                        INSERT INTO alarms (`timestamp`, sensor, value, transition, acknowledged)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (timestamp, sensor_name, value_str, transition, acknowledged),
+                    )
+
+        if transition is not None:
+            start_alarm_notification_thread(sensor_name, value_str, timestamp, transition)
+
+    except MySQLError as exc:
         print(
-        f"Alarm bookkeeping failed for sensor={sensor_name!r}, "
-        f"value={value_str!r}, timestamp={timestamp!r}: {exc}"
+            f"Alarm bookkeeping failed for sensor={sensor_name!r}, "
+            f"value={value_str!r}, timestamp={timestamp!r}: {exc}"
         )
         return
-
 
 @app.post("/api/data")
 def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str, Any]:
@@ -366,7 +642,6 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
     sensor = SIGNAL_TABLE[payload.sensor]
 
     try:
-        # Parse once here to reject malformed values before DB insert.
         sensor.value(payload.value)
     except ValueError as exc:
         raise HTTPException(
@@ -378,20 +653,22 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
 
     try:
         with db_connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO monitored_data (timestamp, sensor, value)
-                VALUES (?, ?, ?)
-                """,
-                (timestamp, payload.sensor, payload.value),
-            )
-    except sqlite3.Error as exc:
+            with closing(connection.cursor()) as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO monitored_data (`timestamp`, sensor, value)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (timestamp, payload.sensor, payload.value),
+                )
+    except MySQLError as exc:
         raise HTTPException(
             status_code=503,
             detail="Could not store sensor reading",
         ) from exc
 
     check_for_alarm(payload.sensor, payload.value, timestamp)
+    archive_old_rows_if_due()
 
     return {
         "status": "ok",
@@ -420,27 +697,30 @@ def format_local_time(timestamp: Optional[int], language: str) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_latest_sensor_state(sensor_name: str, language:str) -> tuple[Optional[int], Optional[str], Optional[int], str]:
+def get_latest_sensor_state(sensor_name: str, language: str) -> tuple[Optional[int], Optional[str], Optional[int], str]:
     """Fetch the latest state for one sensor from sensor_states."""
-    with db_connection() as connection:           
-        connection.execute("PRAGMA busy_timeout = 30000")
-        row = connection.execute(
-            """
-            SELECT last_timestamp, last_value, last_state
-            FROM sensor_states
-            WHERE sensor = ?
-            """,
-            (sensor_name,),
-        ).fetchone()
+    with db_connection() as connection:
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(
+                """
+                SELECT last_timestamp, last_value, last_state
+                FROM sensor_states
+                WHERE sensor = %s
+                """,
+                (sensor_name,),
+            )
+            row = cursor.fetchone()
+
     sensor = SIGNAL_TABLE[sensor_name]
     label = sensor.description(language)
+
     if row is None:
         return None, None, None, label
+
     value = sensor.value(row[1])
     value_str = sensor.format(value)
-    is_valid = 1 if int(row[2])==0 else 0
-    return int(row[0]), value_str, is_valid, label 
-
+    is_valid = 1 if int(row[2]) == 0 else 0
+    return int(row[0]), value_str, is_valid, label
 
 def get_sensor_points_many(
     sensors: list[str],
@@ -450,73 +730,58 @@ def get_sensor_points_many(
     if not sensors:
         return {}
 
-    placeholders = ",".join("?" for _ in sensors)
+    placeholders = ",".join(["%s"] * len(sensors))
 
     with db_connection() as connection:
-        rows = connection.execute(
-            f"""
-            SELECT sensor, timestamp, value
-            FROM monitored_data
-            WHERE sensor IN ({placeholders})
-              AND timestamp BETWEEN ? AND ?
-            ORDER BY sensor, timestamp
-            """,
-            [*sensors, start_timestamp, end_timestamp],
-        ).fetchall()
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(
+                f"""
+                SELECT sensor, `timestamp`, value
+                FROM monitored_data
+                WHERE sensor IN ({placeholders})
+                  AND `timestamp` BETWEEN %s AND %s
+                ORDER BY sensor, `timestamp`
+                """,
+                [*sensors, start_timestamp, end_timestamp],
+            )
+            rows = cursor.fetchall()
 
     result: dict[str, list[tuple[int, float]]] = {sensor: [] for sensor in sensors}
 
     for sensor_name, timestamp, value_str in rows:
+        sensor_name = str(sensor_name)
         sensor = SIGNAL_TABLE[sensor_name]
         result[sensor_name].append((int(timestamp), sensor.value(value_str)))
 
     return result
 
-
 def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
     """Fetch the latest formatted value and status for each requested sensor.
 
-    Returns:
-        {
-            sensor_name: {
-                "value": formatted_value,
-                "status": "ok" | "alarm" | "stale" | "no_data" | "no_range",
-                "color": html_color,
-            },
-            ...
-        }
-
-    Behavior:
-        - no data: "--", grey
-        - malformed data: "--", grey
-        - no valid range: last value, black, even if old/stalled
-        - stale validating sensor: last value, orange
-        - fresh validating sensor in range: last value, green
-        - fresh validating sensor out of range: last value, red
+    Sensors without a validation range stay black even when stale.
     """
     if not sensors:
         return {}
 
     now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
-    placeholders = ",".join("?" for _ in sensors)
+    placeholders = ",".join(["%s"] * len(sensors))
 
     query = f"""
-        SELECT sensor, timestamp, value
-        FROM (
-            SELECT sensor, timestamp, value,
-                ROW_NUMBER() OVER (
-                    PARTITION BY sensor
-                    ORDER BY timestamp DESC, rowid DESC
-                ) AS rn
+        SELECT md.sensor, md.`timestamp`, md.value
+        FROM monitored_data AS md
+        INNER JOIN (
+            SELECT sensor, MAX(id) AS latest_id
             FROM monitored_data
             WHERE sensor IN ({placeholders})
-        )
-        WHERE rn = 1
+            GROUP BY sensor
+        ) AS latest
+            ON latest.latest_id = md.id
     """
 
     with db_connection() as connection:
-        connection.execute("PRAGMA busy_timeout = 30000")
-        rows = connection.execute(query, sensors).fetchall()
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(query, sensors)
+            rows = cursor.fetchall()
 
     values: dict[str, dict[str, str]] = {}
 
@@ -622,7 +887,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
             datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ)
             for timestamp in timestamps
         ]
-
+        
         figure.add_trace(
             go.Scatter(
                 x=x_values,
@@ -810,7 +1075,7 @@ def dashboard_page(request: Request) -> None:
                 sensor = SIGNAL_TABLE[sensor_name]
                 with ui.card().classes("status-card grow"):
                     with ui.row().classes("items-center gap-3"):
-                        indicator = ui.html(make_indicator_html("no-data"))
+                        indicator = ui.html(make_indicator_html("no_data"))
                         label = ui.label(sensor.description(state["language"])).classes("font-semibold")
                     value_label = ui.label(tr("no_data")).classes("text-sm")
                     status_label = ui.label(tr("no_data")).classes("text-xs uppercase")
@@ -943,37 +1208,37 @@ def get_alarm_rows(timespan_key: str, language: str, limit: int = 500) -> list[d
     now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
     timespan_seconds = ALARM_TIMESPANS_SECONDS[timespan_key]
 
-    with db_connection() as connection:           
-        connection.execute("PRAGMA busy_timeout = 30000")
-
-        if timespan_seconds is None:
-            rows = connection.execute(
-                """
-                SELECT timestamp, sensor, value, transition
-                FROM alarms
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        else:
-            start_timestamp = now_timestamp - timespan_seconds
-            rows = connection.execute(
-                """
-                SELECT timestamp, sensor, value, transition
-                FROM alarms
-                WHERE timestamp >= ?
-                ORDER BY timestamp DESC
-                LIMIT ?
-                """,
-                (start_timestamp, limit),
-            ).fetchall()
+    with db_connection() as connection:
+        with closing(connection.cursor()) as cursor:
+            if timespan_seconds is None:
+                cursor.execute(
+                    """
+                    SELECT `timestamp`, sensor, value, transition
+                    FROM alarms
+                    ORDER BY `timestamp` DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            else:
+                start_timestamp = now_timestamp - timespan_seconds
+                cursor.execute(
+                    """
+                    SELECT `timestamp`, sensor, value, transition
+                    FROM alarms
+                    WHERE `timestamp` >= %s
+                    ORDER BY `timestamp` DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (start_timestamp, limit),
+                )
+            rows = cursor.fetchall()
 
     formatted_rows = []
     for index, row in enumerate(rows):
         timestamp, sensor_name, value_str, transition = row
         transition = int(transition)
-        sensor = SIGNAL_TABLE[sensor_name]
+        sensor = SIGNAL_TABLE[str(sensor_name)]
         value = sensor.value(value_str)
         event = sensor.alarm_msg(transition, language)
         formatted_rows.append(
@@ -982,12 +1247,11 @@ def get_alarm_rows(timespan_key: str, language: str, limit: int = 500) -> list[d
                 "time": format_local_time(int(timestamp), language),
                 "event": event,
                 "transition_code": transition,
-                "value" : sensor.format(value),
+                "value": sensor.format(value),
             }
         )
 
     return formatted_rows
-
 
 @ui.page("/alarms")
 def alarms_page(request: Request) -> None:
@@ -1224,8 +1488,10 @@ def check_startup_configuration() -> None:
 
 def startup() -> None:
     check_startup_configuration()
+    create_database_if_needed()
     create_tables_if_needed()
-
+    archive_old_rows_if_due(force=True)
+    
 app.on_startup(startup)
 
 if __name__ in {"__main__", "__mp_main__"}:

@@ -13,4 +13,7 @@ dependencies:
       - requests
       - asyncua
       - numpy
+      - mysql-connector-python
+      - ydantic-settings 
+      - python-dotenv
       
