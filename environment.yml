@@ -1,0 +1,13 @@
+name: nicegui-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - nicegui
+      - plotly
+      - pydantic
+      - fastapi
+      - uvicorn
+      - requests
