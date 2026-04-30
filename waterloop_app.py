@@ -727,9 +727,6 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
     }
 
 
-# ---------------------------------------------------------------------
-# Dashboard UI
-# ---------------------------------------------------------------------
 
 def choose_language_from_request(request: Request) -> str:
     """Return 'fr' for French browsers, otherwise default to English."""
@@ -1066,6 +1063,10 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
 
     return figure
 
+# ---------------------------------------------------------------------
+# Main page UI
+# ---------------------------------------------------------------------
+
 
 @ui.page("/")
 def dashboard_page(request: Request) -> None:
@@ -1164,6 +1165,8 @@ def dashboard_page(request: Request) -> None:
         timespan_select.update()
         alarms_button.text = tr("alarms")
         alarms_button.update()
+        archive_button.text = tr("archive")
+        archive_button.update()
         refresh_status()
         refresh_plots()
 
@@ -1243,8 +1246,8 @@ def dashboard_page(request: Request) -> None:
 
         # Bottom buttons
         with ui.row().classes("w-full items-end gap-3"):
-            #refresh_button = ui.button(tr("refresh"), on_click=refresh_plots)
             alarms_button = ui.button(tr("alarms"), on_click=lambda: ui.navigate.to("/alarms"))
+            archive_button = ui.button(tr("archive"), on_click=lambda: ui.navigate.to("/archive"))
         if NTFY_TOPIC is not None:
             ui.separator()
             ui.label(tr("phone_registration").format(NTFY_TOPIC=NTFY_TOPIC)).classes("text-sm text-gray-600")
@@ -1257,8 +1260,9 @@ def dashboard_page(request: Request) -> None:
 
 
 # ---------------------------------------------------------------------
-# Scheme
+# SVG Scheme
 # ---------------------------------------------------------------------
+
 SCHEME_SVG_TEMPLATE_FILES = {
     "en": BASE_DIR / "water_loop_scheme_en.svg",
     "fr": BASE_DIR / "water_loop_scheme_fr.svg",
@@ -1347,7 +1351,7 @@ def api_scheme_values() -> dict[str, dict[str, str]]:
 
 
 # ---------------------------------------------------------------------
-# Insert alarm-table UI functions below this line.
+# Alarm table UI
 # ---------------------------------------------------------------------
 
 
@@ -1585,6 +1589,261 @@ def alarms_page(request: Request) -> None:
         )
 
         alarm_table.no_data_label = tr("no_rows")
+
+
+# ---------------------------------------------------------------------
+# Archive plotter UI
+# ---------------------------------------------------------------------
+
+
+@ui.page("/archive")
+def archive_page(request: Request) -> None:
+    """Archived monitored-data viewer page.
+
+    English-only page for plotting archived rows from monitored_data_archive.
+    """
+
+    ARCHIVE_TABLE = "monitored_data_archive"
+    LANGUAGE = "en"
+
+    now = datetime.now(tz=LOCAL_TZ)
+    today = now.date()
+    default_start = datetime.fromtimestamp(
+        int(now.timestamp()) - 7 * 24 * 3600,
+        tz=LOCAL_TZ,
+    ).date()
+
+    state: dict[str, Any] = {
+        "start_date": default_start.isoformat(),
+        "end_date": today.isoformat(),
+    }
+
+    plot_items: list[dict[str, Any]] = []
+
+    def signal_options() -> dict[str, str]:
+        return {
+            sensor_name: SIGNAL_TABLE[sensor_name].description(LANGUAGE)
+            for sensor_name in sorted(
+                SIGNAL_TABLE.keys(),
+                key=lambda name: SIGNAL_TABLE[name].description(LANGUAGE),
+            )
+        }
+
+    def sensor_unit(sensor_name: str) -> str:
+        """Return the sensor unit when the sensor class defines one."""
+        return str(getattr(SIGNAL_TABLE[sensor_name], "__unit__", "") or "")
+
+    def yaxis_label(sensor_name: str) -> str:
+        description = SIGNAL_TABLE[sensor_name].description(LANGUAGE)
+        unit = sensor_unit(sensor_name)
+        return f"{description} ({unit})" if unit else description
+
+    def parse_day_window() -> tuple[Optional[int], Optional[int]]:
+        """Convert selected YYYY-MM-DD dates to an inclusive local-day timestamp window."""
+        try:
+            start_day = datetime.fromisoformat(state["start_date"]).date()
+            end_day = datetime.fromisoformat(state["end_date"]).date()
+        except ValueError:
+            ui.notify("Invalid date selection", type="negative")
+            return None, None
+
+        if end_day < start_day:
+            ui.notify("The end date must be after the start date", type="negative")
+            return None, None
+
+        start_dt = datetime(
+            start_day.year,
+            start_day.month,
+            start_day.day,
+            0,
+            0,
+            0,
+            tzinfo=LOCAL_TZ,
+        )
+        end_dt = datetime(
+            end_day.year,
+            end_day.month,
+            end_day.day,
+            23,
+            59,
+            59,
+            tzinfo=LOCAL_TZ,
+        )
+
+        return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+    def get_archive_sensor_points(
+        sensor_name: str,
+        start_timestamp: int,
+        end_timestamp: int,
+    ) -> list[tuple[int, float]]:
+        """Fetch all archived points for one sensor and selected day window."""
+        points: list[tuple[int, float]] = []
+
+        try:
+            with db_connection() as connection:
+                with closing(connection.cursor()) as cursor:
+                    cursor.execute(
+                        f"""
+                        SELECT `timestamp`, value
+                        FROM {ARCHIVE_TABLE}
+                        WHERE sensor = %s
+                          AND `timestamp` BETWEEN %s AND %s
+                        ORDER BY `timestamp`
+                        """,
+                        (sensor_name, start_timestamp, end_timestamp),
+                    )
+                    rows = cursor.fetchall()
+
+        except MySQLError as exc:
+            print(f"Could not fetch archived plot data for {sensor_name!r}: {exc}")
+            return points
+
+        sensor = SIGNAL_TABLE[sensor_name]
+
+        for timestamp, value_str in rows:
+            try:
+                points.append((int(timestamp), sensor.value(value_str)))
+            except Exception as exc:
+                print(
+                    f"Skipping invalid archived row for sensor={sensor_name!r}, "
+                    f"timestamp={timestamp!r}, value={value_str!r}: {exc}"
+                )
+
+        return points
+
+    def make_archive_figure(sensor_name: str) -> go.Figure:
+        """Build one archived signal Plotly figure."""
+        start_timestamp, end_timestamp = parse_day_window()
+
+        figure = go.Figure()
+
+        if start_timestamp is None or end_timestamp is None:
+            points = []
+        else:
+            points = get_archive_sensor_points(
+                sensor_name=sensor_name,
+                start_timestamp=start_timestamp,
+                end_timestamp=end_timestamp,
+            )
+
+        x_values = [
+            datetime.fromtimestamp(timestamp, tz=LOCAL_TZ)
+            for timestamp, _ in points
+        ]
+        y_values = [value for _, value in points]
+
+        figure.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode="lines",
+                hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y}<extra></extra>",
+            )
+        )
+
+        figure.update_layout(
+            title=SIGNAL_TABLE[sensor_name].description(LANGUAGE),
+            xaxis_title="Time",
+            yaxis_title=yaxis_label(sensor_name),
+            margin={"l": 60, "r": 20, "t": 50, "b": 50},
+            showlegend=False,
+            xaxis={
+                "tickformat": "%Y-%m-%d<br>%H:%M",
+                "hoverformat": "%Y-%m-%d %H:%M:%S",
+            },
+            template="plotly_white",
+            height=360,
+        )
+
+        return figure
+
+    def refresh_plot(plot_state: dict[str, Any]) -> None:
+        sensor_name = str(plot_state["select"].value)
+        plot_state["figure"].figure = make_archive_figure(sensor_name)
+        plot_state["figure"].update()
+
+    def refresh_all_plots() -> None:
+        state["start_date"] = str(start_date_input.value)
+        state["end_date"] = str(end_date_input.value)
+
+        for plot_state in list(plot_items):
+            refresh_plot(plot_state)
+
+    def remove_plot(plot_state: dict[str, Any]) -> None:
+        if plot_state in plot_items:
+            plot_items.remove(plot_state)
+
+        plot_state["card"].delete()
+
+    def add_plot() -> None:
+        options = signal_options()
+        default_sensor = next(iter(options.keys()))
+
+        with plots_column:
+            card = ui.card().classes("w-full p-4 gap-3")
+
+            plot_state: dict[str, Any] = {}
+
+            with card:
+                with ui.row().classes("w-full items-end gap-3"):
+                    signal_select = ui.select(
+                        options,
+                        value=default_sensor,
+                        label="Signal",
+                    ).classes("grow min-w-80")
+
+                    remove_button = ui.button(
+                        "Remove",
+                        color="negative",
+                    ).props("outline")
+
+                plot_widget = ui.plotly(
+                    make_archive_figure(default_sensor)
+                ).classes("w-full")
+
+            plot_state.update(
+                {
+                    "card": card,
+                    "select": signal_select,
+                    "figure": plot_widget,
+                }
+            )
+
+            signal_select.on(
+                "update:model-value",
+                lambda _event, item=plot_state: refresh_plot(item),
+            )
+            remove_button.on_click(lambda item=plot_state: remove_plot(item))
+
+            plot_items.append(plot_state)
+
+    with ui.column().classes("w-full p-4 gap-4"):
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.label("Archive").classes("text-2xl font-bold")
+
+            ui.button(
+                "Back",
+                on_click=lambda: ui.run_javascript("history.back()"),
+            ).props("outline")
+
+        with ui.row().classes("w-full items-end justify-between gap-3"):
+            with ui.row().classes("items-end gap-3"):
+                start_date_input = ui.input(
+                    "From",
+                    value=state["start_date"],
+                ).props("type=date").classes("w-44")
+
+                end_date_input = ui.input(
+                    "To",
+                    value=state["end_date"],
+                ).props("type=date").classes("w-44")
+
+            ui.button("Refresh", on_click=refresh_all_plots)
+
+        plots_column = ui.column().classes("w-full gap-4")
+
+        ui.button("Add plot", on_click=add_plot).props("outline")
 
 # ---------------------------------------------------------------------
 # Application start

@@ -40,6 +40,7 @@ en = {
     "too_low": "too low",
     "stopped": "stopped",
     "invalid_state": "invalid state",
+    "archive":"Archive"
 }
 
 
@@ -83,6 +84,7 @@ fr = {
     "too_low": "trop faible",
     "stopped": "arrêté(e)",
     "invalid_state": "état invalide",
+    "archive":"Archive"
 }
 
 
