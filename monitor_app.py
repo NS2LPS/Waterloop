@@ -269,8 +269,8 @@ def send_alarm_notification(sensor: str, value_str: str, timestamp: int, transit
         with urlrequest.urlopen(req, timeout=5):
             pass
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        print(f"ntfy notification failed for message={message!r}, ")
-
+        print(f"ntfy notification failed for message={message!r}: {exc}")   
+        
 def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int, transition: int) -> None:
     """Start notification sending in a daemon thread to avoid API timeout."""
     thread = threading.Thread(

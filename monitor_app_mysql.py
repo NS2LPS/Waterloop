@@ -11,6 +11,7 @@ from collections.abc import Iterator
 import re
 
 import numpy as np
+import math
 import plotly.graph_objects as go
 import mysql.connector
 from mysql.connector.connection import MySQLConnection
@@ -22,7 +23,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from nicegui import ui, app
 
 # Sensors and signals
-from sensors import SIGNAL_TABLE
+from signals import SIGNAL_TABLE
 
 # Translation table
 from languages import translate
@@ -57,6 +58,7 @@ class Settings(BaseSettings):
     db_password: str = ""
     db_name: str = "waterloop"
     create_database_if_needed: bool = True
+    db_pool_size: int = 10
 
     monitored_data_retention_days: int = 180
     alarms_retention_days: int = 365
@@ -194,6 +196,9 @@ SERVER_DATABASE_CONFIG = {
     if key != "database"
 }
 
+_db_pool: Optional[mysql.connector.pooling.MySQLConnectionPool] = None
+_db_pool_lock = threading.Lock()
+
 # ---------------------------------------------------------------------
 # Archive / retention settings
 # ---------------------------------------------------------------------
@@ -211,12 +216,29 @@ def quote_mysql_identifier(identifier: str) -> str:
         raise RuntimeError(f"Unsafe MySQL identifier: {identifier!r}")
     return f"`{identifier}`"
 
+def get_db_pool() -> mysql.connector.pooling.MySQLConnectionPool:
+    """Return the shared MySQL connection pool, creating it lazily."""
+    global _db_pool
+
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = mysql.connector.pooling.MySQLConnectionPool(
+                    pool_name="waterloop_pool",
+                    pool_size=settings.db_pool_size,
+                    pool_reset_session=True,
+                    **DATABASE_CONFIG,
+                )
+
+    return _db_pool
+
 
 @contextmanager
-def db_connection() -> Iterator[MySQLConnection]:
-    """Open a MySQL connection and commit/rollback the transaction."""
-    connection = mysql.connector.connect(**DATABASE_CONFIG)
+def db_connection() -> Iterator[Any]:
+    """Borrow a MySQL connection from the pool and commit/rollback the transaction."""
+    connection = get_db_pool().get_connection()
     connection.autocommit = False
+
     try:
         yield connection
         connection.commit()
@@ -261,7 +283,6 @@ def create_database_if_needed() -> None:
 
 def create_tables_if_needed() -> None:
     """Create the MySQL tables and indexes if needed."""
-    create_database_if_needed()
 
     with db_connection() as connection:
         with closing(connection.cursor()) as cursor:
@@ -273,14 +294,13 @@ def create_tables_if_needed() -> None:
                     sensor VARCHAR(128) NOT NULL,
                     value VARCHAR(255) NOT NULL,
                     PRIMARY KEY (id),
-                    KEY idx_monitored_data_sensor_timestamp (sensor, `timestamp`),
+                    KEY idx_monitored_data_sensor_timestamp_id (sensor, `timestamp` DESC, id DESC),
                     KEY idx_monitored_data_timestamp (`timestamp`)
                 ) ENGINE=InnoDB
-                  DEFAULT CHARSET=utf8mb4
-                  COLLATE=utf8mb4_unicode_ci
+                DEFAULT CHARSET=utf8mb4
+                COLLATE=utf8mb4_unicode_ci
                 """
             )
-
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS alarms (
@@ -327,7 +347,7 @@ def create_tables_if_needed() -> None:
                     archived_at BIGINT NOT NULL,
                     PRIMARY KEY (id),
                     UNIQUE KEY uq_monitored_data_archive_original_id (original_id),
-                    KEY idx_monitored_data_archive_sensor_timestamp (sensor, `timestamp`),
+                    KEY idx_monitored_data_sensor_timestamp_id (sensor, `timestamp` DESC, id DESC),
                     KEY idx_monitored_data_archive_timestamp (`timestamp`)
                 ) ENGINE=InnoDB
                   DEFAULT CHARSET=utf8mb4
@@ -504,8 +524,8 @@ def archive_old_rows_if_due(force: bool = False) -> None:
 # ---------------------------------------------------------------------
 class SensorReadingIn(BaseModel):
     """Payload accepted by the sensor data ingestion endpoint."""
-    sensor: str = Field(..., min_length=1, description="Sensor identifier")
-    value: str = Field(..., min_length=1, description="Sensor value")
+    sensor: str = Field(..., min_length=1, max_length=128, description="Sensor identifier")
+    value: str = Field(..., min_length=1, max_length=255, description="Sensor value")
 
 
 def check_api_token(request: Request) -> None:
@@ -547,7 +567,7 @@ def send_alarm_notification(sensor: str, value_str: str, timestamp: int, transit
         with urlrequest.urlopen(req, timeout=5):
             pass
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        print(f"ntfy notification failed for message={message!r}, ")
+        print(f"ntfy notification failed for message={message!r}: {exc}")
 
 def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int, transition: int) -> None:
     """Start notification sending in a daemon thread to avoid API timeout."""
@@ -559,78 +579,75 @@ def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int,
     thread.start()
 
 
-def check_for_alarm(sensor_name: str, value_str: str, timestamp: int) -> None:
-    """Detect range transitions for known sensors and write alarm events."""
-    if sensor_name not in STATUS_LEDS:
-        return
+def check_for_alarm_in_transaction(
+    cursor,
+    sensor_name: str,
+    value_str: str,
+    timestamp: int,
+) -> Optional[int]:
+    """Detect range transitions and write alarm events using the caller's transaction.
 
-    try:
-        sensor = SIGNAL_TABLE[sensor_name]
-        value = sensor.value(value_str)
-        new_state: int = sensor.validate(value)
-    except Exception as exc:
-        print(
-            f"Alarm bookkeeping failed for sensor={sensor_name!r}, "
-            f"value={value_str!r}, timestamp={timestamp!r}: {exc}"
-        )
-        return
+    Returns:
+        transition code when an alarm transition occurred, otherwise None.
+    """
+    if sensor_name not in STATUS_LEDS:
+        return None
+
+    sensor = SIGNAL_TABLE[sensor_name]
+    value = sensor.value(value_str)
+    new_state: int = sensor.validate(value)
+
+    cursor.execute(
+        """
+        SELECT last_state
+        FROM sensor_states
+        WHERE sensor = %s
+        FOR UPDATE
+        """,
+        (sensor_name,),
+    )
+    row = cursor.fetchone()
+    previous_state = None if row is None else int(row[0])
 
     transition: Optional[int] = None
     acknowledged: Optional[int] = None
 
-    try:
-        with db_connection() as connection:
-            with closing(connection.cursor()) as cursor:
-                cursor.execute(
-                    """
-                    SELECT last_state
-                    FROM sensor_states
-                    WHERE sensor = %s
-                    FOR UPDATE
-                    """,
-                    (sensor_name,),
-                )
-                row = cursor.fetchone()
-                previous_state = None if row is None else int(row[0])
+    # Also fixes the "first bad reading has no alarm" issue.
+    if previous_state is None:
+        if new_state != 0:
+            transition = new_state
+            acknowledged = 0
+    elif previous_state != new_state:
+        transition = new_state
+        acknowledged = 1 if new_state == 0 else 0
 
-                if previous_state is not None and previous_state != new_state:
-                    transition = new_state
-                    acknowledged = 1 if new_state == 0 else 0
+    cursor.execute(
+        """
+        INSERT INTO sensor_states (sensor, last_state, last_timestamp, last_value)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            last_state = VALUES(last_state),
+            last_timestamp = VALUES(last_timestamp),
+            last_value = VALUES(last_value)
+        """,
+        (sensor_name, new_state, timestamp, value_str),
+    )
 
-                cursor.execute(
-                    """
-                    INSERT INTO sensor_states (sensor, last_state, last_timestamp, last_value)
-                    VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        last_state = VALUES(last_state),
-                        last_timestamp = VALUES(last_timestamp),
-                        last_value = VALUES(last_value)
-                    """,
-                    (sensor_name, new_state, timestamp, value_str),
-                )
-
-                if transition is not None and acknowledged is not None:
-                    cursor.execute(
-                        """
-                        INSERT INTO alarms (`timestamp`, sensor, value, transition, acknowledged)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (timestamp, sensor_name, value_str, transition, acknowledged),
-                    )
-
-        if transition is not None:
-            start_alarm_notification_thread(sensor_name, value_str, timestamp, transition)
-
-    except MySQLError as exc:
-        print(
-            f"Alarm bookkeeping failed for sensor={sensor_name!r}, "
-            f"value={value_str!r}, timestamp={timestamp!r}: {exc}"
+    if transition is not None and acknowledged is not None:
+        cursor.execute(
+            """
+            INSERT INTO alarms (`timestamp`, sensor, value, transition, acknowledged)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (timestamp, sensor_name, value_str, transition, acknowledged),
         )
-        return
+
+    return transition
+
 
 @app.post("/api/data")
 def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str, Any]:
-    """Store one sensor value in the monitored_data table."""
+    """Store one sensor value and update alarm state in one transaction."""
     check_api_token(request)
 
     if payload.sensor not in SIGNAL_TABLE:
@@ -642,7 +659,14 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
     sensor = SIGNAL_TABLE[payload.sensor]
 
     try:
-        sensor.value(payload.value)
+        value = sensor.value(payload.value)
+
+        if isinstance(value, float) and not math.isfinite(value):
+            raise HTTPException(
+                status_code=400,
+                detail="Sensor value must be finite before database insertion",
+            )
+
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -650,6 +674,7 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
         ) from exc
 
     timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
+    transition: Optional[int] = None
 
     try:
         with db_connection() as connection:
@@ -661,13 +686,28 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
                     """,
                     (timestamp, payload.sensor, payload.value),
                 )
+
+                transition = check_for_alarm_in_transaction(
+                    cursor=cursor,
+                    sensor_name=payload.sensor,
+                    value_str=payload.value,
+                    timestamp=timestamp,
+                )
+
     except MySQLError as exc:
         raise HTTPException(
             status_code=503,
-            detail="Could not store sensor reading",
+            detail="Could not store sensor reading or alarm state",
         ) from exc
 
-    check_for_alarm(payload.sensor, payload.value, timestamp)
+    if transition is not None:
+        start_alarm_notification_thread(
+            payload.sensor,
+            payload.value,
+            timestamp,
+            transition,
+        )
+
     archive_old_rows_if_due()
 
     return {
@@ -676,6 +716,7 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
         "sensor": payload.sensor,
         "value": payload.value,
     }
+
 
 # ---------------------------------------------------------------------
 # Dashboard UI
@@ -697,68 +738,133 @@ def format_local_time(timestamp: Optional[int], language: str) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def get_latest_sensor_state(sensor_name: str, language: str) -> tuple[Optional[int], Optional[str], Optional[int], str]:
-    """Fetch the latest state for one sensor from sensor_states."""
-    with db_connection() as connection:
-        with closing(connection.cursor()) as cursor:
-            cursor.execute(
-                """
-                SELECT last_timestamp, last_value, last_state
-                FROM sensor_states
-                WHERE sensor = %s
-                """,
-                (sensor_name,),
+def get_latest_sensor_states_many(
+    sensor_names: list[str],
+    language: str,
+) -> dict[str, tuple[Optional[int], Optional[str], Optional[int], str]]:
+    """Fetch latest states for multiple sensors from sensor_states in one query.
+
+    On database errors, return an empty dict so callers can use no-data fallbacks.
+    """
+    if not sensor_names:
+        return {}
+
+    placeholders = ",".join(["%s"] * len(sensor_names))
+
+    try:
+        with db_connection() as connection:
+            with closing(connection.cursor()) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT sensor, last_timestamp, last_value, last_state
+                    FROM sensor_states
+                    WHERE sensor IN ({placeholders})
+                    """,
+                    sensor_names,
+                )
+                rows = cursor.fetchall()
+
+    except MySQLError as exc:
+        print(f"Could not fetch latest sensor states: {exc}")
+        return {}
+
+    rows_by_sensor = {
+        str(sensor_name): (last_timestamp, last_value, last_state)
+        for sensor_name, last_timestamp, last_value, last_state in rows
+    }
+
+    result: dict[str, tuple[Optional[int], Optional[str], Optional[int], str]] = {}
+
+    for sensor_name in sensor_names:
+        sensor = SIGNAL_TABLE[sensor_name]
+        label = sensor.description(language)
+
+        row = rows_by_sensor.get(sensor_name)
+
+        if row is None:
+            result[sensor_name] = (None, None, None, label)
+            continue
+
+        last_timestamp, last_value, last_state = row
+
+        try:
+            value = sensor.value(last_value)
+            value_str = sensor.format(value)
+            is_valid = 1 if int(last_state) == 0 else 0
+            result[sensor_name] = (
+                int(last_timestamp),
+                value_str,
+                is_valid,
+                label,
             )
-            row = cursor.fetchone()
+        except Exception as exc:
+            print(f"Could not format latest state for {sensor_name!r}: {exc}")
+            result[sensor_name] = (None, None, None, label)
 
-    sensor = SIGNAL_TABLE[sensor_name]
-    label = sensor.description(language)
+    return result
 
-    if row is None:
-        return None, None, None, label
-
-    value = sensor.value(row[1])
-    value_str = sensor.format(value)
-    is_valid = 1 if int(row[2]) == 0 else 0
-    return int(row[0]), value_str, is_valid, label
 
 def get_sensor_points_many(
     sensors: list[str],
     start_timestamp: int,
     end_timestamp: int,
 ) -> dict[str, list[tuple[int, float]]]:
+    """Fetch plot points for multiple sensors.
+
+    On database errors, return empty series for all requested sensors.
+    Bad individual rows are skipped.
+    """
+    result: dict[str, list[tuple[int, float]]] = {sensor: [] for sensor in sensors}
+
     if not sensors:
-        return {}
+        return result
 
     placeholders = ",".join(["%s"] * len(sensors))
 
-    with db_connection() as connection:
-        with closing(connection.cursor()) as cursor:
-            cursor.execute(
-                f"""
-                SELECT sensor, `timestamp`, value
-                FROM monitored_data
-                WHERE sensor IN ({placeholders})
-                  AND `timestamp` BETWEEN %s AND %s
-                ORDER BY sensor, `timestamp`
-                """,
-                [*sensors, start_timestamp, end_timestamp],
-            )
-            rows = cursor.fetchall()
+    try:
+        with db_connection() as connection:
+            with closing(connection.cursor()) as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT sensor, `timestamp`, value
+                    FROM monitored_data
+                    WHERE sensor IN ({placeholders})
+                      AND `timestamp` BETWEEN %s AND %s
+                    ORDER BY sensor, `timestamp`
+                    """,
+                    [*sensors, start_timestamp, end_timestamp],
+                )
+                rows = cursor.fetchall()
 
-    result: dict[str, list[tuple[int, float]]] = {sensor: [] for sensor in sensors}
+    except MySQLError as exc:
+        print(f"Could not fetch plot data: {exc}")
+        return result
 
     for sensor_name, timestamp, value_str in rows:
         sensor_name = str(sensor_name)
-        sensor = SIGNAL_TABLE[sensor_name]
-        result[sensor_name].append((int(timestamp), sensor.value(value_str)))
+
+        if sensor_name not in SIGNAL_TABLE:
+            print(f"Skipping plot row for unknown sensor {sensor_name!r}")
+            continue
+
+        try:
+            sensor = SIGNAL_TABLE[sensor_name]
+            result.setdefault(sensor_name, []).append(
+                (int(timestamp), sensor.value(value_str))
+            )
+        except Exception as exc:
+            print(
+                f"Skipping invalid plot row for sensor={sensor_name!r}, "
+                f"timestamp={timestamp!r}, value={value_str!r}: {exc}"
+            )
 
     return result
+
 
 def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
     """Fetch the latest formatted value and status for each requested sensor.
 
-    Sensors without a validation range stay black even when stale.
+    On database errors, return an empty dict so callers can use no-data fallbacks.
     """
     if not sensors:
         return {}
@@ -767,32 +873,51 @@ def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
     placeholders = ",".join(["%s"] * len(sensors))
 
     query = f"""
-        SELECT md.sensor, md.`timestamp`, md.value
-        FROM monitored_data AS md
-        INNER JOIN (
-            SELECT sensor, MAX(id) AS latest_id
-            FROM monitored_data
-            WHERE sensor IN ({placeholders})
-            GROUP BY sensor
-        ) AS latest
-            ON latest.latest_id = md.id
+        SELECT sensor, `timestamp`, value
+        FROM (
+            SELECT
+                md.sensor,
+                md.`timestamp`,
+                md.value,
+                ROW_NUMBER() OVER (
+                    PARTITION BY md.sensor
+                    ORDER BY md.`timestamp` DESC, md.id DESC
+                ) AS rn
+            FROM monitored_data AS md
+            WHERE md.sensor IN ({placeholders})
+        ) AS ranked
+        WHERE rn = 1
     """
 
-    with db_connection() as connection:
-        with closing(connection.cursor()) as cursor:
-            cursor.execute(query, sensors)
-            rows = cursor.fetchall()
+    try:
+        with db_connection() as connection:
+            with closing(connection.cursor()) as cursor:
+                cursor.execute(query, sensors)
+                rows = cursor.fetchall()
+
+    except MySQLError as exc:
+        print(f"Could not fetch latest scheme sensor values: {exc}")
+        return {}
 
     values: dict[str, dict[str, str]] = {}
 
     for sensor_name, timestamp, value_str in rows:
         sensor_name = str(sensor_name)
+
+        if sensor_name not in SIGNAL_TABLE:
+            print(f"Skipping latest-value row for unknown sensor {sensor_name!r}")
+            continue
+
         sensor_obj = SIGNAL_TABLE[sensor_name]
 
         try:
             value = sensor_obj.value(value_str)
             formatted_value = sensor_obj.format(value)
-        except ValueError:
+        except Exception as exc:
+            print(
+                f"Skipping invalid latest value for sensor={sensor_name!r}, "
+                f"timestamp={timestamp!r}, value={value_str!r}: {exc}"
+            )
             status = "no_data"
             values[sensor_name] = {
                 "value": "--",
@@ -818,6 +943,7 @@ def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
 
     return values
 
+
 def make_indicator_html(status: str) -> str:
     """Create the colored LED-like indicator HTML.
 
@@ -834,6 +960,7 @@ def make_indicator_html(status: str) -> str:
         f'background:{dot_color};box-shadow:0 0 10px {dot_color};'
         'border:1px solid rgba(0,0,0,0.25);"></div>'
     )
+
 
 def split_downsampled_points(
     points: list[tuple[int, float]],
@@ -873,7 +1000,16 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
     ]
 
     sensor_colors: dict[str, str] = {}
-    points_by_sensor = get_sensor_points_many(signals, start_timestamp, now_timestamp)
+
+    try:
+        points_by_sensor = get_sensor_points_many(
+            signals,
+            start_timestamp,
+            now_timestamp,
+        )
+    except Exception as exc:
+        print(f"Could not build plot data for {plot_config.get('title')}: {exc}")
+        points_by_sensor = {sensor: [] for sensor in signals}
 
     figure = go.Figure()
 
@@ -887,7 +1023,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
             datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ)
             for timestamp in timestamps
         ]
-        
+
         figure.add_trace(
             go.Scatter(
                 x=x_values,
@@ -921,8 +1057,15 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
     for sensor in signals:
         if sensor not in STATUS_LEDS:
             continue
+
         sensor_obj = SIGNAL_TABLE[sensor]
-        if hasattr(sensor_obj, "min_value"):
+
+    for sensor in signals:
+        if sensor not in STATUS_LEDS:
+            continue
+        sensor_obj = SIGNAL_TABLE[sensor]
+
+        if hasattr(sensor_obj, "min_value") and sensor_obj.min_value is not None :
             figure.add_hline(
                 y=sensor_obj.min_value,
                 line_dash="dash",
@@ -930,7 +1073,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
                 opacity=0.5,
             )
 
-        if hasattr(sensor_obj, "max_value"):
+        if hasattr(sensor_obj, "max_value") and sensor_obj.max_value is not None:
             figure.add_hline(
                 y=sensor_obj.max_value,
                 line_dash="dash",
@@ -939,6 +1082,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
             )
 
     return figure
+
 
 @ui.page("/")
 def dashboard_page(request: Request) -> None:
@@ -952,11 +1096,23 @@ def dashboard_page(request: Request) -> None:
     tr = lambda s : translate(s,state["language"])
 
     def refresh_status() -> None:
-        """Update existing status cards using only sensor_states."""
+        """Update existing status cards using one batched sensor_states query."""
         language = state["language"]
 
+        try:
+            latest_states = get_latest_sensor_states_many(
+                list(status_items.keys()),
+                language,
+            )
+        except Exception as exc:
+            print(f"Could not refresh status indicators: {exc}")
+            latest_states = {}
+
         for sensor_name, items in status_items.items():
-            timestamp, value_str, is_valid, label = get_latest_sensor_state(sensor_name, language)
+            timestamp, value_str, is_valid, label = latest_states.get(
+                sensor_name,
+                (None, None, None, SIGNAL_TABLE[sensor_name].description(language)),
+            )
 
             if timestamp is None or value_str is None or is_valid is None:
                 status = "no_data"
@@ -991,16 +1147,19 @@ def dashboard_page(request: Request) -> None:
 
             items["status"].text = status_text_by_status.get(status, tr("no_data"))
             items["status"].update()
-        
+
     def refresh_plots() -> None:
         """Update existing Plotly widgets without rebuilding the page."""
         for plot_config, plot_widget in plot_items:
-            plot_widget.figure = make_plot_figure(
-                plot_config,
-                state["language"],
-                state["timespan_hours"],
-            )
-            plot_widget.update()
+            try:
+                plot_widget.figure = make_plot_figure(
+                    plot_config,
+                    state["language"],
+                    state["timespan_hours"],
+                )
+                plot_widget.update()
+            except Exception as exc:
+                print(f"Could not refresh plot {plot_config.get('title')}: {exc}")
 
     def make_timespan_options() -> dict[str, str]:
         return {
@@ -1147,10 +1306,16 @@ def load_scheme_svg(language: str) -> str:
     )
     return svg_file.read_text(encoding="utf-8")
 
+
 def refresh_scheme_values() -> None:
     ui.run_javascript("""
         fetch('/api/scheme-values')
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`scheme-values HTTP ${response.status}`);
+                }
+                return response.json();
+            })
             .then(values => {
                 for (const [key, item] of Object.entries(values)) {
                     const valueElement = document.getElementById(`scheme-value-${key}`);
@@ -1167,13 +1332,22 @@ def refresh_scheme_values() -> None:
                         statusElement.style.stroke = item.color;
                     }
                 }
+            })
+            .catch(error => {
+                console.warn('Could not refresh scheme values:', error);
             });
     """)
+
 
 @app.get("/api/scheme-values")
 def api_scheme_values() -> dict[str, dict[str, str]]:
     sensors = list(set(SCHEME_PLACEHOLDERS.values()))
-    latest_values = get_last_sensor_values(sensors)
+
+    try:
+        latest_values = get_last_sensor_values(sensors)
+    except Exception as exc:
+        print(f"Could not build scheme values response: {exc}")
+        latest_values = {}
 
     result: dict[str, dict[str, str]] = {}
 
@@ -1188,6 +1362,7 @@ def api_scheme_values() -> dict[str, dict[str, str]]:
         )
 
     return result
+
 
 # ---------------------------------------------------------------------
 # Insert alarm-table UI functions below this line.
@@ -1204,54 +1379,80 @@ ALARM_TIMESPANS_SECONDS = {
 
 
 def get_alarm_rows(timespan_key: str, language: str, limit: int = 500) -> list[dict[str, Any]]:
-    """Fetch alarm rows for the selected timespan."""
+    """Fetch alarm rows for the selected timespan.
+
+    On database errors, return an empty table.
+    """
     now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
     timespan_seconds = ALARM_TIMESPANS_SECONDS[timespan_key]
 
-    with db_connection() as connection:
-        with closing(connection.cursor()) as cursor:
-            if timespan_seconds is None:
-                cursor.execute(
-                    """
-                    SELECT `timestamp`, sensor, value, transition
-                    FROM alarms
-                    ORDER BY `timestamp` DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
-            else:
-                start_timestamp = now_timestamp - timespan_seconds
-                cursor.execute(
-                    """
-                    SELECT `timestamp`, sensor, value, transition
-                    FROM alarms
-                    WHERE `timestamp` >= %s
-                    ORDER BY `timestamp` DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (start_timestamp, limit),
-                )
-            rows = cursor.fetchall()
+    try:
+        with db_connection() as connection:
+            with closing(connection.cursor()) as cursor:
+                if timespan_seconds is None:
+                    cursor.execute(
+                        """
+                        SELECT `timestamp`, sensor, value, transition
+                        FROM alarms
+                        ORDER BY `timestamp` DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                else:
+                    start_timestamp = now_timestamp - timespan_seconds
+                    cursor.execute(
+                        """
+                        SELECT `timestamp`, sensor, value, transition
+                        FROM alarms
+                        WHERE `timestamp` >= %s
+                        ORDER BY `timestamp` DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (start_timestamp, limit),
+                    )
+
+                rows = cursor.fetchall()
+
+    except MySQLError as exc:
+        print(f"Could not fetch alarm rows: {exc}")
+        return []
 
     formatted_rows = []
+
     for index, row in enumerate(rows):
         timestamp, sensor_name, value_str, transition = row
-        transition = int(transition)
-        sensor = SIGNAL_TABLE[str(sensor_name)]
-        value = sensor.value(value_str)
-        event = sensor.alarm_msg(transition, language)
-        formatted_rows.append(
-            {
-                "id": index,
-                "time": format_local_time(int(timestamp), language),
-                "event": event,
-                "transition_code": transition,
-                "value": sensor.format(value),
-            }
-        )
+        sensor_name = str(sensor_name)
+
+        if sensor_name not in SIGNAL_TABLE:
+            print(f"Skipping alarm row for unknown sensor {sensor_name!r}")
+            continue
+
+        try:
+            transition = int(transition)
+            sensor = SIGNAL_TABLE[sensor_name]
+            value = sensor.value(value_str)
+            event = sensor.alarm_msg(transition, language)
+
+            formatted_rows.append(
+                {
+                    "id": index,
+                    "time": format_local_time(int(timestamp), language),
+                    "event": event,
+                    "transition_code": transition,
+                    "value": sensor.format(value),
+                }
+            )
+
+        except Exception as exc:
+            print(
+                f"Skipping invalid alarm row for sensor={sensor_name!r}, "
+                f"timestamp={timestamp!r}, value={value_str!r}, "
+                f"transition={transition!r}: {exc}"
+            )
 
     return formatted_rows
+
 
 @ui.page("/alarms")
 def alarms_page(request: Request) -> None:
