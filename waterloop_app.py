@@ -1652,6 +1652,7 @@ def archive_page(request: Request) -> None:
     """
 
     ARCHIVE_TABLE = "monitored_data_archive"
+    CURRENT_TABLE = "monitored_data"
     LANGUAGE = "en"
 
     now = datetime.now(tz=LOCAL_TZ)
@@ -1742,6 +1743,18 @@ def archive_page(request: Request) -> None:
                         (sensor_name, start_timestamp, end_timestamp),
                     )
                     rows = cursor.fetchall()
+
+                    cursor.execute(
+                        f"""
+                        SELECT `timestamp`, value
+                        FROM {CURRENT_TABLE}
+                        WHERE sensor = %s
+                        AND `timestamp` BETWEEN %s AND %s
+                        ORDER BY `timestamp`
+                        """,
+                        (sensor_name, start_timestamp, end_timestamp),
+                    )
+                    rows += cursor.fetchall()
 
         except MySQLError as exc:
             print(f"Could not fetch archived plot data for {sensor_name!r}: {exc}")
