@@ -1214,6 +1214,8 @@ def dashboard_page(request: Request) -> None:
         alarms_button.update()
         archive_button.text = tr("archive")
         archive_button.update()
+        ntfy_label.text = tr("phone_registration").format(NTFY_TOPIC=NTFY_TOPIC)
+        ntfy_label.update()
         refresh_status()
         refresh_plots()
 
@@ -1297,7 +1299,7 @@ def dashboard_page(request: Request) -> None:
             archive_button = ui.button(tr("archive"), on_click=lambda: ui.navigate.to("/archive"))
         if NTFY_TOPIC is not None:
             ui.separator()
-            ui.label(tr("phone_registration").format(NTFY_TOPIC=NTFY_TOPIC)).classes("text-sm text-gray-600")
+            ntfy_label = ui.label(tr("phone_registration").format(NTFY_TOPIC=NTFY_TOPIC)).classes("text-sm text-gray-600")
 
     refresh_status()
     refresh_plots()

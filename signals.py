@@ -30,15 +30,15 @@ pmp07_state = sensors.IntSensorValidValues(
     )
 
 # Groupes froids
-gf01_state = sensors.StateSensor({"en":"GF01 State","fr":"GF01"})
+gf01_state = sensors.StateSensor({"en":"GF01 State","fr":"GF01 état"})
 gf01_temperature_out = sensors.FloatSensor(
-    {"en": "GF01 Exit Temperature", "fr": "GF01 sortie"},
+    {"en": "GF01 Exit Temperature", "fr": "GF01 température de sortie"},
     "°C",
     )
 
-gf02_state = sensors.StateSensor({"en":"GF02 State","fr":"GF02"})
+gf02_state = sensors.StateSensor({"en":"GF02 State","fr":"GF02 état"})
 gf02_temperature_out = sensors.FloatSensor(
-    {"en": "GF02 Exit Temperature", "fr": "GF02 sortie"},
+    {"en": "GF02 Exit Temperature", "fr": "GF02 température de sortie"},
     "°C",
     )
 
