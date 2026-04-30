@@ -1,0 +1,11 @@
+nicegui
+plotly
+pydantic
+fastapi
+uvicorn
+requests
+asyncua
+numpy
+mysql-connector-python
+pydantic-settings
+python-dotenv
