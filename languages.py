@@ -1,7 +1,7 @@
 # Translation table
 
 en = {
-    "title": "Water Loop Monitor",
+    "title": "Water Loop Monitoring",
     "alarm_title": "Alarm history",
     "language": "Language",
     "timespan": "Timespan",
