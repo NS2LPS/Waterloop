@@ -61,6 +61,11 @@ secondary_flow_1 = sensors.FloatSensorValidRange(
     0,1000,
     )
 
+# External Temperature
+external_temperature_1 = sensors.FloatSensor(
+    {"en": "External Temperature", "fr": "Température extérieure"},
+    "°C",)
+
 SIGNAL_TABLE = {
     "primary_pressure_1": primary_pressure_1,
     "primary_temperature_1": primary_temperature_1,
@@ -73,5 +78,6 @@ SIGNAL_TABLE = {
     "gf02_temperature_out": gf02_temperature_out,
     "gf01_state": gf01_state,
     "gf02_state": gf02_state,
-    "valve_command": valve_command
+    "valve_command": valve_command,
+    "external_temperature_1" : external_temperature_1
 }

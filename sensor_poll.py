@@ -77,6 +77,11 @@ OPCUA_NODES = {
         "type" : "float",
         "scale": 0.1,
     },
+    "external_temperature_1": {
+        "node_id": "ns=2;s=ARM01A.Device1.GEN.EA.T_EXT",
+        "type" : "float",
+        "scale": 0.1,
+    },
 }
 
 

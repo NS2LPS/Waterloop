@@ -1520,7 +1520,6 @@ def alarms_page(request: Request) -> None:
             "week": tr("last_week"),
             "month": tr("last_month"),
             "year": tr("last_year"),
-            "all": tr("all"),
         }
 
     def make_columns() -> list[dict[str, Any]]:
