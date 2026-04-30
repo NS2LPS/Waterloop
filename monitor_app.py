@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from nicegui import ui, app
 
 # Sensors and signals
-from sensors import SIGNAL_TABLE
+from signals import SIGNAL_TABLE
 
 # Translation table
 from languages import translate
@@ -270,7 +270,7 @@ def send_alarm_notification(sensor: str, value_str: str, timestamp: int, transit
             pass
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         print(f"ntfy notification failed for message={message!r}: {exc}")   
-        
+
 def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int, transition: int) -> None:
     """Start notification sending in a daemon thread to avoid API timeout."""
     thread = threading.Thread(
@@ -657,7 +657,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
         if sensor not in STATUS_LEDS:
             continue
         sensor_obj = SIGNAL_TABLE[sensor]
-        if hasattr(sensor_obj, "min_value"):
+        if hasattr(sensor_obj, "min_value") and sensor_obj.min_value is not None :
             figure.add_hline(
                 y=sensor_obj.min_value,
                 line_dash="dash",
@@ -665,7 +665,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
                 opacity=0.5,
             )
 
-        if hasattr(sensor_obj, "max_value"):
+        if hasattr(sensor_obj, "max_value") and sensor_obj.max_value is not None:
             figure.add_hline(
                 y=sensor_obj.max_value,
                 line_dash="dash",
