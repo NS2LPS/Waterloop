@@ -376,6 +376,53 @@ def create_tables_if_needed() -> None:
             )
 
 
+def refresh_sensor_description_table() -> None:
+    """Rebuild the sensor_description table from SIGNAL_TABLE at startup."""
+
+    rows = [
+        (
+            sensor_name,
+            sensor.description("en"),
+            sensor.description("fr"),
+        )
+        for sensor_name, sensor in SIGNAL_TABLE.items()
+    ]
+
+    with db_connection() as connection:
+        with closing(connection.cursor()) as cursor:
+            cursor.execute(
+                """
+                DROP TABLE IF EXISTS sensor_description
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE sensor_description (
+                    key_name VARCHAR(128) NOT NULL,
+                    description_en VARCHAR(255) NOT NULL,
+                    description_fr VARCHAR(255) NOT NULL,
+                    PRIMARY KEY (key_name)
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            if rows:
+                cursor.executemany(
+                    """
+                    INSERT INTO sensor_description (
+                        key_name,
+                        description_en,
+                        description_fr
+                    )
+                    VALUES (%s, %s, %s)
+                    """,
+                    rows,
+                )
+
+
 def archive_monitored_data_batch(cursor, cutoff_timestamp: int, archived_at: int, batch_size: int) -> int:
     """Move one batch of old monitored_data rows into monitored_data_archive."""
     cursor.execute(
@@ -1932,6 +1979,7 @@ def startup() -> None:
     check_startup_configuration()
     create_database_if_needed()
     create_tables_if_needed()
+    refresh_sensor_description_table()
     archive_old_rows_if_due(force=True)
     
 app.on_startup(startup)
