@@ -47,7 +47,7 @@ gf02_temperature_out = sensors.FloatSensor(
 secondary_temperature_1 = sensors.FloatSensorValidRange(
     {"en": "Water Loop Temperature", "fr": "Température boucle d'eau"},
     "°C",
-    None,20.5,
+    None,18.0,
     )
 
 secondary_temperature_2 = sensors.FloatSensor(

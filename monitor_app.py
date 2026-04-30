@@ -86,7 +86,7 @@ PLOTS = [
         "signals": ["primary_temperature_1", "secondary_temperature_1"],
         "legend" : [{"en":"Primary","fr":"Primaire"},{"en":"Secondary","fr":"Secondaire"}]
     },
-    {
+"""     {
         "title": {"en": "Primary Pressure", "fr": "Pression primaire"},
         "xlabel": {"en": "Time", "fr": "Temps"},
         "ylabel": {"en": "Pressure (bar)", "fr": "Pression (bar)"},
@@ -98,7 +98,7 @@ PLOTS = [
         "ylabel": {"en": "Flow rate (L/min)", "fr": "Débit (L/min)"},
         "signals": ["secondary_flow_1"],
     },
-]
+ """]
 
 # ntfy notification settings.
 #
