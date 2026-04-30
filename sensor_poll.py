@@ -224,7 +224,8 @@ async def read_opcua_measurements() -> dict[str, str]:
     """Connect to the OPC UA server and read all configured nodes."""
     client = Client(url=ENDPOINT)
     client.application_uri = APPLICATION_URI
-
+    client.session_timeout = 60_000
+    
     try:
         await client.connect()
         return await read_opcua_nodes_once(client, OPCUA_NODES)
