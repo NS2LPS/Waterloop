@@ -1603,7 +1603,7 @@ def alarms_page(request: Request) -> None:
             ).classes("w-56")
 
             refresh_button = ui.button(tr("refresh"), on_click=refresh_table)
-            back_button = ui.button(tr("back"),ui.navigate.to("/"),)
+            back_button = ui.button(tr("back"),on_click=lambda: ui.navigate.to("/"))
 
 
         alarm_table = ui.table(
@@ -1878,7 +1878,7 @@ def archive_page(request: Request) -> None:
     with ui.column().classes("w-full p-4 gap-4"):
         with ui.row().classes("w-full items-center justify-between"):
             ui.label("Archive").classes("text-2xl font-bold")
-            ui.button("Back",ui.navigate.to("/")).props("outline")
+            ui.button("Back",on_click=lambda: ui.navigate.to("/")).props("outline")
 
         with ui.row().classes("w-full items-end justify-between gap-3"):
             with ui.row().classes("items-end gap-3"):
