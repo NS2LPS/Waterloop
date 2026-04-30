@@ -8,7 +8,6 @@ from typing import Any, Optional
 import threading
 from contextlib import contextmanager
 from collections.abc import Iterator
-import numpy as np
 
 import plotly.graph_objects as go
 from fastapi import HTTPException, Request
@@ -570,31 +569,6 @@ def make_indicator_html(status: str) -> str:
         'border:1px solid rgba(0,0,0,0.25);"></div>'
     )
 
-def split_downsampled_points(
-    points: list[tuple[int, float]],
-    max_points: int = 2000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return downsampled timestamp and value arrays."""
-    if not points:
-        return np.array([], dtype=np.int64), np.array([], dtype=float)
-
-    data = np.asarray(points, dtype=float)
-    n_points = data.shape[0]
-
-    if n_points > max_points:
-        indices = np.linspace(
-            0,
-            n_points - 1,
-            num=max_points,
-            dtype=np.int64,
-        )
-        data = data[indices]
-
-    timestamps = data[:, 0].astype(np.int64)
-    values = data[:, 1]
-
-    return timestamps, values
-
 
 def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours: float) -> go.Figure:
     """Build a Plotly figure for one PLOTS entry."""
@@ -612,16 +586,20 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
 
     figure = go.Figure()
 
+    if language == "fr":
+        x_tickformat = "%d/%m<br>%H:%M"
+        x_hoverformat = "%d/%m/%Y %H:%M:%S"
+    else:
+        x_tickformat = "%Y-%m-%d<br>%H:%M"
+        x_hoverformat = "%Y-%m-%d %H:%M:%S"
+
     for index, sensor in enumerate(signals):
         color = plotly_default_colors[index % len(plotly_default_colors)]
         sensor_colors[sensor] = color
 
         points = points_by_sensor.get(sensor, [])
-        timestamps, y_values = split_downsampled_points(points, max_points=2000)
-        x_values = [
-            datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ)
-            for timestamp in timestamps
-        ]
+        x_values = [datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ) for timestamp, _ in points]
+        y_values = [value for _, value in points]
 
         figure.add_trace(
             go.Scatter(
@@ -631,6 +609,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
                 name=plot_config["legend"][index][language] if "legend" in plot_config else None,
                 line={"color": color, "shape": "linear"},
                 marker={"color": color},
+                hovertemplate="%{x|" + x_hoverformat + "}<br>%{y}<extra></extra>",
             )
         )
 
@@ -640,6 +619,9 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
         yaxis_title=plot_config["ylabel"][language],
         margin={"l": 50, "r": 20, "t": 50, "b": 50},
         showlegend="legend" in plot_config,
+        xaxis={
+        "tickformat": x_tickformat,
+        "hoverformat": x_hoverformat,},
         template="plotly_white",
         height=360,
         legend=dict(
@@ -742,8 +724,7 @@ def dashboard_page(request: Request) -> None:
             1 : "1h",
             12 : "12h",
             24 : "24h",
-            168 : translate("last_week",state["language"]),
-            720 : translate("last_month",state["language"]),
+            48 : "48h",
             }
        
 

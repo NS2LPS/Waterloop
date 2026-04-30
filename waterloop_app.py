@@ -10,7 +10,6 @@ from contextlib import contextmanager, closing
 from collections.abc import Iterator
 import re
 
-import numpy as np
 import math
 import plotly.graph_objects as go
 import mysql.connector
@@ -60,7 +59,7 @@ class Settings(BaseSettings):
     create_database_if_needed: bool = True
     db_pool_size: int = 10
 
-    monitored_data_retention_days: int = 180
+    monitored_data_retention_days: int = 4
     alarms_retention_days: int = 365
     archive_rollover_period_seconds: int = 6 * 3600
     archive_batch_size: int = 10_000
@@ -585,17 +584,25 @@ def check_for_alarm_in_transaction(
     value_str: str,
     timestamp: int,
 ) -> Optional[int]:
-    """Detect range transitions and write alarm events using the caller's transaction.
+    """Update latest sensor state and detect alarm transitions.
+
+    All sensors are written to sensor_states.
+
+    Sensors in STATUS_LEDS are validated and may generate alarm rows.
+    Sensors not in STATUS_LEDS are stored with state 0 by default.
 
     Returns:
         transition code when an alarm transition occurred, otherwise None.
     """
-    if sensor_name not in STATUS_LEDS:
-        return None
-
     sensor = SIGNAL_TABLE[sensor_name]
-    value = sensor.value(value_str)
-    new_state: int = sensor.validate(value)
+
+    is_alarm_sensor = sensor_name in STATUS_LEDS
+
+    if is_alarm_sensor:
+        value = sensor.value(value_str)
+        new_state: int = sensor.validate(value)
+    else:
+        new_state = 0
 
     cursor.execute(
         """
@@ -612,14 +619,17 @@ def check_for_alarm_in_transaction(
     transition: Optional[int] = None
     acknowledged: Optional[int] = None
 
-    # Also fixes the "first bad reading has no alarm" issue.
-    if previous_state is None:
-        if new_state != 0:
+    if is_alarm_sensor:
+        # First bad reading creates an alarm.
+        if previous_state is None:
+            if new_state != 0:
+                transition = new_state
+                acknowledged = 0
+
+        # Later state changes create alarm or back-to-normal events.
+        elif previous_state != new_state:
             transition = new_state
-            acknowledged = 0
-    elif previous_state != new_state:
-        transition = new_state
-        acknowledged = 1 if new_state == 0 else 0
+            acknowledged = 1 if new_state == 0 else 0
 
     cursor.execute(
         """
@@ -643,7 +653,6 @@ def check_for_alarm_in_transaction(
         )
 
     return transition
-
 
 @app.post("/api/data")
 def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str, Any]:
@@ -864,6 +873,8 @@ def get_sensor_points_many(
 def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
     """Fetch the latest formatted value and status for each requested sensor.
 
+    Uses sensor_states, which stores the latest known value/state for each sensor.
+
     On database errors, return an empty dict so callers can use no-data fallbacks.
     """
     if not sensors:
@@ -872,27 +883,17 @@ def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
     now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
     placeholders = ",".join(["%s"] * len(sensors))
 
-    query = f"""
-        SELECT sensor, `timestamp`, value
-        FROM (
-            SELECT
-                md.sensor,
-                md.`timestamp`,
-                md.value,
-                ROW_NUMBER() OVER (
-                    PARTITION BY md.sensor
-                    ORDER BY md.`timestamp` DESC, md.id DESC
-                ) AS rn
-            FROM monitored_data AS md
-            WHERE md.sensor IN ({placeholders})
-        ) AS ranked
-        WHERE rn = 1
-    """
-
     try:
         with db_connection() as connection:
             with closing(connection.cursor()) as cursor:
-                cursor.execute(query, sensors)
+                cursor.execute(
+                    f"""
+                    SELECT sensor, last_timestamp, last_value, last_state
+                    FROM sensor_states
+                    WHERE sensor IN ({placeholders})
+                    """,
+                    sensors,
+                )
                 rows = cursor.fetchall()
 
     except MySQLError as exc:
@@ -901,7 +902,7 @@ def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
 
     values: dict[str, dict[str, str]] = {}
 
-    for sensor_name, timestamp, value_str in rows:
+    for sensor_name, timestamp, value_str, last_state in rows:
         sensor_name = str(sensor_name)
 
         if sensor_name not in SIGNAL_TABLE:
@@ -928,12 +929,12 @@ def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
 
         age_seconds = now_timestamp - int(timestamp)
 
-        if not hasattr(sensor_obj, "validate"):
-            status = "no_range"
-        elif age_seconds > STALE_AFTER_SECONDS:
+        if age_seconds > STALE_AFTER_SECONDS:
             status = "stale"
+        elif not hasattr(sensor_obj, "validate"):
+            status = "no_range"
         else:
-            status = "ok" if sensor_obj.validate(value) == 0 else "alarm"
+            status = "ok" if int(last_state) == 0 else "alarm"
 
         values[sensor_name] = {
             "value": formatted_value,
@@ -962,32 +963,6 @@ def make_indicator_html(status: str) -> str:
     )
 
 
-def split_downsampled_points(
-    points: list[tuple[int, float]],
-    max_points: int = 2000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return downsampled timestamp and value arrays."""
-    if not points:
-        return np.array([], dtype=np.int64), np.array([], dtype=float)
-
-    data = np.asarray(points, dtype=float)
-    n_points = data.shape[0]
-
-    if n_points > max_points:
-        indices = np.linspace(
-            0,
-            n_points - 1,
-            num=max_points,
-            dtype=np.int64,
-        )
-        data = data[indices]
-
-    timestamps = data[:, 0].astype(np.int64)
-    values = data[:, 1]
-
-    return timestamps, values
-
-
 def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours: float) -> go.Figure:
     """Build a Plotly figure for one PLOTS entry."""
     now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
@@ -1013,16 +988,20 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
 
     figure = go.Figure()
 
+    if language == "fr":
+        x_tickformat = "%d/%m<br>%H:%M"
+        x_hoverformat = "%d/%m/%Y %H:%M:%S"
+    else:
+        x_tickformat = "%Y-%m-%d<br>%H:%M"
+        x_hoverformat = "%Y-%m-%d %H:%M:%S"
+
     for index, sensor in enumerate(signals):
         color = plotly_default_colors[index % len(plotly_default_colors)]
         sensor_colors[sensor] = color
 
         points = points_by_sensor.get(sensor, [])
-        timestamps, y_values = split_downsampled_points(points, max_points=2000)
-        x_values = [
-            datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ)
-            for timestamp in timestamps
-        ]
+        x_values = [datetime.fromtimestamp(int(timestamp), tz=LOCAL_TZ) for timestamp, _ in points]
+        y_values = [value for _, value in points]
 
         figure.add_trace(
             go.Scatter(
@@ -1032,6 +1011,7 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
                 name=plot_config["legend"][index][language] if "legend" in plot_config else None,
                 line={"color": color, "shape": "linear"},
                 marker={"color": color},
+                hovertemplate="%{x|" + x_hoverformat + "}<br>%{y}<extra></extra>",
             )
         )
 
@@ -1041,6 +1021,9 @@ def make_plot_figure(plot_config: dict[str, Any], language: str, timespan_hours:
         yaxis_title=plot_config["ylabel"][language],
         margin={"l": 50, "r": 20, "t": 50, "b": 50},
         showlegend="legend" in plot_config,
+        xaxis={
+        "tickformat": x_tickformat,
+        "hoverformat": x_hoverformat,},
         template="plotly_white",
         height=360,
         legend=dict(
@@ -1166,8 +1149,7 @@ def dashboard_page(request: Request) -> None:
             1 : "1h",
             12 : "12h",
             24 : "24h",
-            168 : translate("last_week",state["language"]),
-            720 : translate("last_month",state["language"]),
+            48 : "48h",
             }
        
 

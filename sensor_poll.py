@@ -1,12 +1,15 @@
 import asyncio
 import json
 import math
+import os
 import time
+from pathlib import Path
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 from asyncua import Client
 from asyncua.ua import AttributeIds, ReadParameters, ReadValueId
+from dotenv import load_dotenv
 
 
 POLL_PERIOD_SECONDS = 60
@@ -15,9 +18,12 @@ SECONDARY_WATER_LOOP_URL = "http://adm-uc-a.lps.u-psud.fr/data"
 # NiceGUI/FastAPI monitor app POST endpoint.
 MONITOR_APP_POST_URL = "http://127.0.0.1:8080/api/data"
 
+# Load local .env file containing WATERLOOP_API_TOKEN=...
+load_dotenv(Path(__file__).resolve().with_name(".env"))
+
 # Must match API_TOKEN in monitor_app_v1.py.
-# Leave as None if the app has API_TOKEN = None.
-API_TOKEN: str | None = None
+# Leave WATERLOOP_API_TOKEN unset if the app has API_TOKEN = None.
+API_TOKEN = os.getenv("WATERLOOP_API_TOKEN") or None
 
 # OPC UA settings.
 ENDPOINT = "opc.tcp://129.175.113.201:49320"

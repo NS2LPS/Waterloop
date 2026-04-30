@@ -1,469 +1,192 @@
 # Water Loop Monitor
 
-A small FastAPI/NiceGUI application for monitoring water-loop sensor values, displaying live status indicators, plotting recent measurements, updating an SVG process scheme, and recording alarm transitions.
+A small FastAPI/NiceGUI application for monitoring water-loop sensor values on a local network. It receives sensor readings through an HTTP API, stores them in MySQL, displays live status indicators and plots, updates an SVG process scheme, records alarm transitions, and can send ntfy notifications.
 
-## Overview
+The app is intended for a small deployment such as a lab or technical room dashboard. It is suitable for a local network with a limited number of viewers, provided the plot history and database retention settings are kept reasonable.
 
-The application provides:
+## Main features
 
-- A NiceGUI web dashboard at `/`.
+- NiceGUI dashboard at `/`.
 - LED-style status cards for selected validating sensors.
-- A live SVG water-loop scheme with sensor values injected into placeholder text elements.
-- Plotly time-series graphs for pressure, temperature, and flow.
-- A data ingestion API at `POST /api/data`.
-- An alarm history page at `/alarms`.
-- A scheme-value API at `GET /api/scheme-values`.
-- A local SQLite database, `water_loop.db`.
+- Live SVG water-loop scheme with injected sensor values.
+- Plotly time-series graphs for temperatures, pressure, and flow.
+- Data ingestion API at `POST /api/data`.
+- Alarm history page at `/alarms`.
+- Scheme-values API at `GET /api/scheme-values`.
+- MySQL storage with connection pooling.
+- Live tables plus archive tables for old measurements and alarms.
 - Optional API-token protection for ingestion.
-- Optional ntfy notifications for new alarm events.
+- Optional ntfy notifications for new alarm transitions.
+- English/French UI strings through `languages.py`.
 
-The application uses sensor definitions from `sensors.py` and translations from `languages.py`.
+## Source files
 
-## Startup behavior
+Typical file roles:
 
-Startup is handled with NiceGUI's startup hook:
+| File | Purpose |
+| --- | --- |
+| `waterloop_app.py` | Main NiceGUI/FastAPI application, MySQL setup, routes, alarm logic, dashboard, archive logic. |
+| `signals.py` | Sensor configuration: declared sensors, units, valid ranges/states, and `SIGNAL_TABLE`. |
+| `sensors.py` | Sensor classes used by `signals.py`: parsing, formatting, validation, alarm messages. |
+| `languages.py` | English/French translation table. |
+| `water_loop_scheme_en.svg` | English SVG process scheme. |
+| `water_loop_scheme_fr.svg` | French SVG process scheme. |
+| `.env` | Local configuration and secrets. Do not commit this file if it contains passwords or tokens. |
 
-```python
-app.on_startup(startup)
+## Configuration overview
+
+Runtime settings are loaded from environment variables or from a `.env` file next to `waterloop_app.py`.
+
+All environment variables use the `WATERLOOP_` prefix. For example, the Python setting `db_host` is configured as `WATERLOOP_DB_HOST`.
+
+The app uses `pydantic-settings`, so values in the real environment override values in `.env`.
+
+## Example `.env`
+
+```bash
+# MySQL connection
+WATERLOOP_DB_HOST=127.0.0.1
+WATERLOOP_DB_PORT=3306
+WATERLOOP_DB_USER=waterloop
+WATERLOOP_DB_PASSWORD=change-me
+WATERLOOP_DB_NAME=waterloop
+
+# Database creation and connection pool
+WATERLOOP_CREATE_DATABASE_IF_NEEDED=true
+WATERLOOP_DB_POOL_SIZE=10
+
+# Retention and archiving
+# For 1-minute logging and 24h max plots, 4 days is usually enough.
+WATERLOOP_MONITORED_DATA_RETENTION_DAYS=4
+WATERLOOP_ALARMS_RETENTION_DAYS=365
+WATERLOOP_ARCHIVE_ROLLOVER_PERIOD_SECONDS=21600
+WATERLOOP_ARCHIVE_BATCH_SIZE=10000
+
+# API ingestion token
+# Leave empty only on a fully trusted local network.
+WATERLOOP_API_TOKEN=change-me-long-random-token
+
+# ntfy notifications
+# Leave WATERLOOP_NTFY_TOPIC empty to disable notifications.
+WATERLOOP_NTFY_SERVER=https://ntfy.sh
+WATERLOOP_NTFY_TOPIC=
+WATERLOOP_NTFY_PRIORITY=urgent
 ```
 
-The startup function performs configuration validation and creates the database tables/indexes if needed.
+## `.env` parameters
 
-At startup, the app should validate:
+### MySQL connection
 
-- Required SVG scheme files exist:
-  - `water_loop_scheme_en.svg`
-  - `water_loop_scheme_fr.svg`
-- Every sensor listed in `STATUS_LEDS` exists in `SIGNAL_TABLE`.
-- Every sensor listed in `STATUS_LEDS` has a `validate()` method.
-- Database tables and indexes exist.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WATERLOOP_DB_HOST` | `127.0.0.1` | MySQL server hostname or IP address. |
+| `WATERLOOP_DB_PORT` | `3306` | MySQL TCP port. |
+| `WATERLOOP_DB_USER` | `waterloop` | MySQL user used by the application. |
+| `WATERLOOP_DB_PASSWORD` | empty | MySQL password. |
+| `WATERLOOP_DB_NAME` | `waterloop` | MySQL database name. |
+| `WATERLOOP_CREATE_DATABASE_IF_NEEDED` | `true` | If true, the app tries to create the database at startup. |
+| `WATERLOOP_DB_POOL_SIZE` | `10` | Number of MySQL connections in the application pool. |
 
-Recommended additional startup checks:
+For production or semi-production use, prefer creating the database manually and granting only the required privileges to the application user. Then set:
 
-- Every sensor used in `PLOTS` exists in `SIGNAL_TABLE`.
-- Every sensor used in `SCHEME_PLACEHOLDERS` exists in `SIGNAL_TABLE`.
-- Plot legend lengths match their signal lists when a `legend` field is provided.
-
-The `if __name__ in {"__main__", "__mp_main__"}` block should only start the NiceGUI server with `ui.run(...)`.
-
-## Configuration
-
-Main configuration values are defined in `monitor_app.py`.
-
-### Database
-
-```python
-DATABASE_FILE = BASE_DIR / "water_loop.db"
+```bash
+WATERLOOP_CREATE_DATABASE_IF_NEEDED=false
 ```
 
-### Time zone
+### Retention and archiving
 
-```python
-LOCAL_TZ = ZoneInfo("Europe/Paris")
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `WATERLOOP_MONITORED_DATA_RETENTION_DAYS` | `180` | Number of days kept in the live `monitored_data` table before rows are moved to `monitored_data_archive`. |
+| `WATERLOOP_ALARMS_RETENTION_DAYS` | `365` | Number of days kept in the live `alarms` table before rows are moved to `alarms_archive`. |
+| `WATERLOOP_ARCHIVE_ROLLOVER_PERIOD_SECONDS` | `21600` | Minimum delay between archive runs. Default is 6 hours. |
+| `WATERLOOP_ARCHIVE_BATCH_SIZE` | `10000` | Maximum number of old rows moved per table per archive run. |
+
+For 1-minute logging, a 24-hour maximum plot range, and a small local deployment, a practical live-data retention is:
+
+```bash
+WATERLOOP_MONITORED_DATA_RETENTION_DAYS=4
 ```
+
+This keeps enough margin for recent debugging while keeping the live table small. Older rows are kept in the archive table.
+
+Archive rollover is not a separate cron job. It runs:
+
+- at application startup, and
+- after successful `POST /api/data` ingestion when the rollover period has elapsed.
 
 ### API token
 
-By default:
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WATERLOOP_API_TOKEN` | empty / unset | Optional token required by `POST /api/data`. |
 
-```python
-API_TOKEN = None
-```
-
-When `API_TOKEN` is `None`, ingestion requests are accepted without a token.
-
-When set to a string, clients must send:
+When `WATERLOOP_API_TOKEN` is set, clients must send:
 
 ```text
 X-API-Token: your-token-here
 ```
 
-### Refresh intervals
+When it is empty or unset, the ingestion endpoint accepts requests without a token. That is convenient for testing, but any device that can reach the app can inject readings. For a real local-network deployment, set a token.
 
-```python
-LED_REFRESH_PERIOD_SECONDS = 5
-PLOT_REFRESH_PERIOD_SECONDS = 30
-STALE_AFTER_SECONDS = 5 * 60
-```
+### ntfy notifications
 
-A validating sensor whose most recent value is older than `STALE_AFTER_SECONDS` is considered stale.
-
-## Status model and colors
-
-The app uses shared status names for dashboard indicators and SVG scheme coloring.
-
-Recommended status color map:
-
-```python
-SCHEME_STATUS_COLORS = {
-    "ok": "#16a34a",        # green
-    "alarm": "#dc2626",     # red
-    "stale": "#f97316",     # orange
-    "no_data": "#9ca3af",   # grey
-    "no_range": "#000000",  # black
-}
-```
-
-Status meanings:
-
-| Status | Meaning | Color |
+| Variable | Default | Meaning |
 | --- | --- | --- |
-| `ok` | Fresh validating sensor, value within valid range | Green |
-| `alarm` | Fresh validating sensor, value outside valid range | Red |
-| `stale` | Validating sensor has an old value | Orange |
-| `no_data` | No value or malformed value | Grey |
-| `no_range` | Sensor has no `validate()` method | Black |
+| `WATERLOOP_NTFY_SERVER` | `https://ntfy.sh` | ntfy server URL. |
+| `WATERLOOP_NTFY_TOPIC` | empty / unset | ntfy topic. If empty, notifications are disabled. |
+| `WATERLOOP_NTFY_PRIORITY` | `urgent` | ntfy priority header. |
 
-Important behavior:
+When enabled, the app sends a notification for new alarm transitions. The current notification logic skips `transition == 0`, so back-to-normal events are stored in MySQL but are not sent to ntfy.
 
-- Stale validating sensors keep displaying their last formatted value, but turn orange.
-- Sensors without a valid range stay black, even if their latest value is old.
-- Missing data displays `--` in grey.
-- Malformed historical data should display `--` in grey.
+If alarm messages are sensitive, use a private random topic, restrict access, or self-host ntfy.
 
-## Dashboard
+## MySQL setup
 
-The dashboard is served at:
+Install and start MySQL or MariaDB, then create a database and user. Example:
 
-```text
-GET /
+```sql
+CREATE DATABASE waterloop
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+CREATE USER 'waterloop'@'localhost' IDENTIFIED BY 'change-me';
+
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX
+ON waterloop.*
+TO 'waterloop'@'localhost';
+
+FLUSH PRIVILEGES;
 ```
 
-It includes:
+If the app should create tables but not create the database itself, use:
 
-- Title and language buttons.
-- SVG scheme.
-- LED-style status cards.
-- Timespan selector.
-- Plotly graphs.
-- Link/button to the alarm history page.
-
-### LED status cards
-
-`STATUS_LEDS` defines which sensors appear as LED cards:
-
-```python
-STATUS_LEDS = [
-    "secondary_temperature_1",
-    "primary_pressure_1",
-    "primary_temperature_1",
-    "secondary_flow_1",
-    "pmp07_state",
-]
+```bash
+WATERLOOP_CREATE_DATABASE_IF_NEEDED=false
 ```
 
-Every sensor in `STATUS_LEDS` must exist in `SIGNAL_TABLE` and must have a `validate()` method.
+If `WATERLOOP_CREATE_DATABASE_IF_NEEDED=true`, the app connects without selecting a database first and runs `CREATE DATABASE IF NOT EXISTS`. In that case, the MySQL user needs enough privilege to create or access the configured database.
 
-The LED indicator helper should accept status names, not legacy color names:
+## Database tables
 
-```python
-def make_indicator_html(status: str) -> str:
-    """Create the colored LED-like indicator HTML.
-
-    Valid statuses:
-        ok, alarm, stale, no_data, no_range
-    """
-    dot_color = SCHEME_STATUS_COLORS.get(
-        status,
-        SCHEME_STATUS_COLORS["no_data"],
-    )
-
-    return (
-        '<div style="width:18px;height:18px;border-radius:50%;'
-        f'background:{dot_color};box-shadow:0 0 10px {dot_color};'
-        'border:1px solid rgba(0,0,0,0.25);"></div>'
-    )
-```
-
-Initial indicators should be created with:
-
-```python
-make_indicator_html("no_data")
-```
-
-not with legacy strings such as `"grey"`.
-
-## SVG scheme
-
-The SVG scheme files are loaded from:
-
-```python
-SCHEME_SVG_TEMPLATE_FILES = {
-    "en": BASE_DIR / "water_loop_scheme_en.svg",
-    "fr": BASE_DIR / "water_loop_scheme_fr.svg",
-}
-```
-
-The SVG placeholders are mapped to internal sensor names:
-
-```python
-SCHEME_PLACEHOLDERS = {
-    "P001": "primary_pressure_1",
-    "T001": "gf01_temperature_out",
-    "T002": "gf02_temperature_out",
-    "T005": "primary_temperature_1",
-    "T004": "primary_temperature_2",
-    "D001": "secondary_flow_1",
-    "T006": "secondary_temperature_1",
-    "T007": "secondary_temperature_2",
-    "V001": "valve_command",
-}
-```
-
-In the SVG, text elements should have IDs like:
-
-```xml
-<text id="scheme-value-P001">--</text>
-```
-
-Optional status markers can be added with IDs like:
-
-```xml
-<circle id="scheme-status-P001" cx="100" cy="100" r="5" fill="#9ca3af" />
-```
-
-The JavaScript updater can then update both:
-
-- `scheme-value-P001`
-- `scheme-status-P001`
-
-### Scheme value refresh
-
-The scheme refresh JavaScript should expect structured objects:
-
-```python
-def refresh_scheme_values() -> None:
-    ui.run_javascript("""
-        fetch('/api/scheme-values')
-            .then(response => response.json())
-            .then(values => {
-                for (const [key, item] of Object.entries(values)) {
-                    const valueElement = document.getElementById(`scheme-value-${key}`);
-
-                    if (valueElement) {
-                        valueElement.textContent = item.value;
-                        valueElement.style.fill = item.color;
-                    }
-
-                    const statusElement = document.getElementById(`scheme-status-${key}`);
-
-                    if (statusElement) {
-                        statusElement.style.fill = item.color;
-                        statusElement.style.stroke = item.color;
-                    }
-                }
-            });
-    """)
-```
-
-## Scheme values API
-
-The scheme values endpoint is:
-
-```text
-GET /api/scheme-values
-```
-
-It returns a structured object per SVG placeholder.
-
-Example response:
-
-```json
-{
-  "P001": {
-    "value": "2.8 bar",
-    "status": "ok",
-    "color": "#16a34a"
-  },
-  "T001": {
-    "value": "7.2 °C",
-    "status": "no_range",
-    "color": "#000000"
-  },
-  "D001": {
-    "value": "420.0 L/min",
-    "status": "stale",
-    "color": "#f97316"
-  },
-  "V001": {
-    "value": "35.0 %",
-    "status": "no_range",
-    "color": "#000000"
-  }
-}
-```
-
-Recommended implementation:
-
-```python
-@app.get("/api/scheme-values")
-def api_scheme_values() -> dict[str, dict[str, str]]:
-    sensors = list(set(SCHEME_PLACEHOLDERS.values()))
-    latest_values = get_last_sensor_values(sensors)
-
-    result: dict[str, dict[str, str]] = {}
-
-    for placeholder, sensor_name in SCHEME_PLACEHOLDERS.items():
-        result[placeholder] = latest_values.get(
-            sensor_name,
-            {
-                "value": "--",
-                "status": "no_data",
-                "color": SCHEME_STATUS_COLORS["no_data"],
-            },
-        )
-
-    return result
-```
-
-## Latest sensor values helper
-
-`get_last_sensor_values()` should return structured value/status/color dictionaries.
-
-Recommended implementation:
-
-```python
-def get_last_sensor_values(sensors: list[str]) -> dict[str, dict[str, str]]:
-    """Fetch the latest formatted value and status for each requested sensor.
-
-    Returns:
-        {
-            sensor_name: {
-                "value": formatted_value,
-                "status": "ok" | "alarm" | "stale" | "no_data" | "no_range",
-                "color": html_color,
-            },
-            ...
-        }
-
-    Behavior:
-        - no data: "--", grey
-        - malformed data: "--", grey
-        - no valid range: last value, black, even if old/stalled
-        - stale validating sensor: last value, orange
-        - fresh validating sensor in range: last value, green
-        - fresh validating sensor out of range: last value, red
-    """
-    if not sensors:
-        return {}
-
-    now_timestamp = int(datetime.now(tz=LOCAL_TZ).timestamp())
-    placeholders = ",".join("?" for _ in sensors)
-
-    query = f"""
-        SELECT sensor, timestamp, value
-        FROM (
-            SELECT sensor, timestamp, value,
-                ROW_NUMBER() OVER (
-                    PARTITION BY sensor
-                    ORDER BY timestamp DESC, rowid DESC
-                ) AS rn
-            FROM monitored_data
-            WHERE sensor IN ({placeholders})
-        )
-        WHERE rn = 1
-    """
-
-    with db_connection() as connection:
-        connection.execute("PRAGMA busy_timeout = 30000")
-        rows = connection.execute(query, sensors).fetchall()
-
-    values: dict[str, dict[str, str]] = {}
-
-    for sensor_name, timestamp, value_str in rows:
-        sensor_name = str(sensor_name)
-        sensor_obj = SIGNAL_TABLE[sensor_name]
-
-        try:
-            value = sensor_obj.value(value_str)
-            formatted_value = sensor_obj.format(value)
-        except ValueError:
-            status = "no_data"
-            values[sensor_name] = {
-                "value": "--",
-                "status": status,
-                "color": SCHEME_STATUS_COLORS[status],
-            }
-            continue
-
-        age_seconds = now_timestamp - int(timestamp)
-
-        if not hasattr(sensor_obj, "validate"):
-            status = "no_range"
-        elif age_seconds > STALE_AFTER_SECONDS:
-            status = "stale"
-        else:
-            status = "ok" if sensor_obj.validate(value) == 0 else "alarm"
-
-        values[sensor_name] = {
-            "value": formatted_value,
-            "status": status,
-            "color": SCHEME_STATUS_COLORS[status],
-        }
-
-    return values
-```
-
-## Plots
-
-`PLOTS` defines the dashboard graphs.
-
-Current plot groups:
-
-- Loop temperatures:
-  - `primary_temperature_1`
-  - `secondary_temperature_1`
-- Primary pressure:
-  - `primary_pressure_1`
-- Secondary flow:
-  - `secondary_flow_1`
-
-Each plot can define:
-
-- `title`
-- `xlabel`
-- `ylabel`
-- `signals`
-- optional `legend`
-
-Plot data are queried from `monitored_data` over the selected timespan.
-
-## Database structure
-
-The app uses a local SQLite database:
-
-```text
-water_loop.db
-```
-
-Tables are created by `create_tables_if_needed()`.
+The app creates tables automatically at startup.
 
 ### `monitored_data`
 
-Stores all accepted sensor readings.
+Stores accepted raw sensor readings.
 
 | Column | Type | Description |
 | --- | --- | --- |
-| `timestamp` | `INTEGER NOT NULL` | Unix timestamp in seconds |
-| `sensor` | `TEXT NOT NULL` | Sensor identifier |
-| `value` | `TEXT NOT NULL` | Raw posted sensor value |
-
-Notes:
-
-- Values are stored as text because the ingestion payload accepts strings.
-- Values are parsed by the corresponding sensor object when displayed, plotted, or validated.
-- Unknown sensors should be rejected before insertion.
-- Malformed values should be rejected before insertion.
+| `id` | `BIGINT UNSIGNED AUTO_INCREMENT` | Primary key. |
+| `timestamp` | `BIGINT NOT NULL` | Server receive time as Unix epoch seconds. |
+| `sensor` | `VARCHAR(128) NOT NULL` | Internal sensor name, for example `primary_pressure_1`. |
+| `value` | `VARCHAR(255) NOT NULL` | Raw posted value as text. |
 
 Indexes:
 
-```sql
-CREATE INDEX IF NOT EXISTS idx_monitored_data_sensor_timestamp
-ON monitored_data (sensor, timestamp);
-
-CREATE INDEX IF NOT EXISTS idx_monitored_data_timestamp
-ON monitored_data (timestamp);
-```
+- primary key on `id`
+- `(sensor, timestamp DESC, id DESC)` for latest/range queries
+- `(timestamp)` for retention/archive queries
 
 ### `alarms`
 
@@ -471,103 +194,105 @@ Stores alarm transition events.
 
 | Column | Type | Description |
 | --- | --- | --- |
-| `timestamp` | `INTEGER NOT NULL` | Unix timestamp in seconds |
-| `sensor` | `TEXT NOT NULL` | Sensor identifier |
-| `value` | `TEXT NOT NULL` | Raw value at transition |
-| `transition` | `INTEGER NOT NULL` | New alarm state; `0` means back to normal |
-| `acknowledged` | `INTEGER NOT NULL DEFAULT 0` | `0` or `1` |
+| `id` | `BIGINT UNSIGNED AUTO_INCREMENT` | Primary key. |
+| `timestamp` | `BIGINT NOT NULL` | Transition time as Unix epoch seconds. |
+| `sensor` | `VARCHAR(128) NOT NULL` | Sensor name. |
+| `value` | `VARCHAR(255) NOT NULL` | Raw value at transition. |
+| `transition` | `INT NOT NULL` | New state. `0` means back to normal. |
+| `acknowledged` | `TINYINT NOT NULL DEFAULT 0` | `0` or `1`. |
 
 Indexes:
 
-```sql
-CREATE INDEX IF NOT EXISTS idx_alarms_sensor_timestamp
-ON alarms (sensor, timestamp);
-
-CREATE INDEX IF NOT EXISTS idx_alarms_timestamp
-ON alarms (timestamp);
-```
+- primary key on `id`
+- `(sensor, timestamp)`
+- `(timestamp)`
 
 ### `sensor_states`
 
-Stores the latest known validation state for each validating status sensor.
+Stores the latest known value and state per sensor.
 
 | Column | Type | Description |
 | --- | --- | --- |
-| `sensor` | `TEXT PRIMARY KEY` | Sensor identifier |
-| `last_state` | `INTEGER NOT NULL` | `0` if valid; non-zero if invalid |
-| `last_timestamp` | `INTEGER NOT NULL` | Timestamp of the latest reading |
-| `last_value` | `TEXT NOT NULL` | Raw latest value |
+| `sensor` | `VARCHAR(128)` | Primary key. |
+| `last_state` | `INT NOT NULL` | Latest validation state. `0` means normal/valid. |
+| `last_timestamp` | `BIGINT NOT NULL` | Timestamp of latest reading. |
+| `last_value` | `VARCHAR(255) NOT NULL` | Latest raw value. |
 
-Index:
+For validating sensors, `last_state` is produced by the sensor's `validate()` method. For non-validating sensors, use state `0` by default so the table can also serve as the fast latest-value source for the SVG scheme.
 
-```sql
-CREATE INDEX IF NOT EXISTS idx_sensor_states_last_timestamp
-ON sensor_states (last_timestamp);
-```
+### `monitored_data_archive`
 
-## Sensor definitions
+Archive table for old `monitored_data` rows.
 
-Sensors are defined in `sensors.py` and collected in `SIGNAL_TABLE`.
+Important columns:
 
-Current known sensors:
+- `original_id`: original live-table ID
+- `timestamp`, `sensor`, `value`: copied reading data
+- `archived_at`: archive time as Unix epoch seconds
 
-| Sensor name | Type | Validation |
-| --- | --- | --- |
-| `primary_pressure_1` | Float, bar | Valid range: `2.0` to `3.5` |
-| `primary_temperature_1` | Float, °C | Valid range: `5.0` to `15.0` |
-| `primary_temperature_2` | Float, °C | No range |
-| `valve_command` | Float, % | No range |
-| `pmp07_state` | Integer | Valid values: `[3]` |
-| `gf01_state` | State/int | No range |
-| `gf01_temperature_out` | Float, °C | No range |
-| `gf02_state` | State/int | No range |
-| `gf02_temperature_out` | Float, °C | No range |
-| `secondary_temperature_1` | Float, °C | Valid range: `13.5` to `20.5` |
-| `secondary_temperature_2` | Float, °C | No range |
-| `secondary_flow_1` | Float, L/min | Valid range: `0` to `1000` |
+### `alarms_archive`
 
-## Sensor value parsing
+Archive table for old `alarms` rows.
 
-Sensor classes parse raw string values using their `value()` method.
+Important columns:
 
-Recommended behavior:
+- `original_id`: original live-table ID
+- `timestamp`, `sensor`, `value`, `transition`, `acknowledged`: copied alarm data
+- `archived_at`: archive time as Unix epoch seconds
 
-- Float sensors should reject malformed values.
-- Float sensors should reject `nan`, `inf`, and `-inf`.
-- Integer sensors should reject non-integer strings such as `"3.0"`.
-- Malformed API values should be rejected before insertion into `monitored_data`.
+## Startup behavior
 
-Recommended helpers in `sensors.py`:
+Startup is registered with:
 
 ```python
-import math
-
-
-def parse_float_value(raw_value: str, sensor_name: str) -> float:
-    try:
-        value = float(str(raw_value).strip())
-    except ValueError as exc:
-        raise ValueError(f"Invalid float value for {sensor_name}: {raw_value!r}") from exc
-
-    if not math.isfinite(value):
-        raise ValueError(f"Invalid float value for {sensor_name}: {raw_value!r}")
-
-    return value
-
-
-def parse_int_value(raw_value: str, sensor_name: str) -> int:
-    raw_text = str(raw_value).strip()
-
-    if raw_text == "":
-        raise ValueError(f"Invalid integer value for {sensor_name}: {raw_value!r}")
-
-    if not raw_text.lstrip("+-").isdigit():
-        raise ValueError(f"Invalid integer value for {sensor_name}: {raw_value!r}")
-
-    return int(raw_text)
+app.on_startup(startup)
 ```
 
-## Posting data
+At startup, the app:
+
+1. Validates static configuration.
+2. Optionally creates the MySQL database.
+3. Creates tables and indexes if needed.
+4. Starts an archive rollover check.
+
+Configuration validation checks that:
+
+- required SVG files exist:
+  - `water_loop_scheme_en.svg`
+  - `water_loop_scheme_fr.svg`
+- every sensor listed in `STATUS_LEDS` exists in `SIGNAL_TABLE`
+- every sensor listed in `STATUS_LEDS` has a `validate()` method
+- every sensor used in `PLOTS` exists in `SIGNAL_TABLE`
+- every sensor used in `SCHEME_PLACEHOLDERS` exists in `SIGNAL_TABLE`
+- plot legend lengths match their signal lists when a `legend` field is provided
+
+## Running the application
+
+Install dependencies in your Python environment, configure `.env`, then run:
+
+```bash
+python waterloop_app.py
+```
+
+By default the app starts on:
+
+```text
+http://0.0.0.0:8080
+```
+
+The server is started with:
+
+```python
+ui.run(
+    host="0.0.0.0",
+    port=8080,
+    title="WaterLoop",
+)
+```
+
+For HTTPS, the recommended deployment is to run NiceGUI on `127.0.0.1:8080` and put Caddy or Nginx in front of it to terminate TLS.
+
+## Data ingestion API
 
 Sensor readings are posted to:
 
@@ -584,85 +309,9 @@ Request body:
 }
 ```
 
-Both fields are strings. The server adds the timestamp automatically when the reading is received.
+Both fields are strings. The server adds the timestamp when the reading is received.
 
-### Validation before insertion
-
-The ingestion endpoint should reject invalid data before inserting into `monitored_data`.
-
-Expected behavior:
-
-| Input | Result |
-| --- | --- |
-| Unknown sensor | Rejected with HTTP `400` |
-| Malformed value | Rejected with HTTP `400` |
-| Well-formed in-range value | Inserted |
-| Well-formed out-of-range value | Inserted and alarm-checked |
-| SQLite error | HTTP `503` |
-
-Relevant logic:
-
-```python
-if payload.sensor not in SIGNAL_TABLE:
-    raise HTTPException(
-        status_code=400,
-        detail=f"Unknown sensor: {payload.sensor}",
-    )
-
-sensor = SIGNAL_TABLE[payload.sensor]
-
-try:
-    sensor.value(payload.value)
-except ValueError as exc:
-    raise HTTPException(
-        status_code=400,
-        detail=str(exc),
-    ) from exc
-```
-
-Only after this validation should the row be inserted.
-
-### Python example
-
-```python
-import requests
-
-url = "http://localhost:8080/api/data"
-
-payload = {
-    "sensor": "primary_pressure_1",
-    "value": "3.1",
-}
-
-response = requests.post(url, json=payload, timeout=5)
-response.raise_for_status()
-
-print(response.json())
-```
-
-With API token enabled:
-
-```python
-import requests
-
-url = "http://localhost:8080/api/data"
-
-headers = {
-    "X-API-Token": "your-token-here",
-}
-
-payload = {
-    "sensor": "primary_pressure_1",
-    "value": "3.1",
-}
-
-response = requests.post(url, json=payload, headers=headers, timeout=5)
-response.raise_for_status()
-
-print(response.json())
-```
-
-Example success response:
+Success response:
 
 ```json
 {
@@ -673,70 +322,278 @@ Example success response:
 }
 ```
 
-## Alarm detection
-
-Alarm detection runs for sensors listed in `STATUS_LEDS`.
-
-A validating sensor returns:
-
-- `0` for valid/normal.
-- Non-zero values for invalid/alarm states.
-
-For range sensors:
-
-- `1` means too low.
-- `2` means too high.
-
-For valid-value integer sensors:
-
-- `1` means invalid state.
-
-Recommended transition logic:
+With token protection enabled:
 
 ```python
-if previous_state is not None and previous_state != new_state:
-    transition = new_state
-    acknowledged = 1 if new_state == 0 else 0
+import requests
+
+url = "http://localhost:8080/api/data"
+headers = {"X-API-Token": "your-token-here"}
+payload = {"sensor": "primary_pressure_1", "value": "3.1"}
+
+response = requests.post(url, json=payload, headers=headers, timeout=5)
+response.raise_for_status()
+print(response.json())
 ```
 
-This records:
+Expected validation behavior:
 
-| Previous state | New state | Meaning |
+| Input | Result |
+| --- | --- |
+| Unknown sensor | HTTP `400` |
+| Malformed value | HTTP `400` |
+| Non-finite float such as `nan` or `inf` | HTTP `400` |
+| Well-formed in-range value | Stored in `monitored_data`; state updated. |
+| Well-formed out-of-range value | Stored; state updated; alarm transition may be inserted. |
+| MySQL error | HTTP `503` |
+
+## Alarm model
+
+A validating sensor returns a state code from `validate()`:
+
+| State | Meaning |
+| ---: | --- |
+| `0` | Normal / valid |
+| `1` | Invalid, too low, stopped, or invalid state depending on sensor type |
+| `2` | Too high, for range sensors |
+
+Alarm rows are transition events, not the current state. The current state is stored in `sensor_states`.
+
+Typical behavior:
+
+| Previous state | New state | DB behavior |
 | ---: | ---: | --- |
-| `0` | `1` or `2` | Alarm starts |
-| `1` or `2` | `0` | Back to normal |
-| `1` | `2` | Alarm type changed |
-| `2` | `1` | Alarm type changed |
+| none | `0` | Initialize state; no alarm event. |
+| none | non-zero | Initialize state; insert alarm event. |
+| `0` | non-zero | Insert alarm event. |
+| non-zero | `0` | Insert back-to-normal event. |
+| `1` | `2` | Insert alarm-type-change event. |
+| same state | same state | Update latest timestamp/value; no duplicate alarm event. |
 
-The first reading initializes `sensor_states`. If you want alarms to be generated when the very first reading is invalid, add explicit logic for `previous_state is None and new_state != 0`.
+Important: stale/no-data display state is determined from `last_timestamp`. Unless you add a dedicated stale-alarm checker, a sensor that stops sending data becomes visually stale but does not automatically create a new alarm row or ntfy notification.
 
-## Notifications
+## Status colors
 
-Notifications are sent through ntfy when enabled:
+The dashboard and SVG use these status names:
+
+| Status | Meaning | Color |
+| --- | --- | --- |
+| `ok` | Fresh validating sensor, value is valid | Green |
+| `alarm` | Fresh validating sensor, value is invalid | Red |
+| `stale` | Latest value is older than `STALE_AFTER_SECONDS` | Orange |
+| `no_data` | No row or unreadable value | Grey |
+| `no_range` | Sensor has no `validate()` method | Black |
+
+The default color map is:
 
 ```python
-NTFY_SERVER = "https://ntfy.sh"
-NTFY_TOPIC = None
-NTFY_PRIORITY = "urgent"
+SCHEME_STATUS_COLORS = {
+    "ok": "#16a34a",
+    "alarm": "#dc2626",
+    "stale": "#f97316",
+    "no_data": "#9ca3af",
+    "no_range": "#000000",
+}
 ```
 
-When `NTFY_TOPIC` is `None`, notifications are disabled.
+## Dashboard configuration in `waterloop_app.py`
 
-The current notification function skips recovery notifications when:
+Some UI configuration is still kept directly in `waterloop_app.py`.
+
+### Refresh intervals
 
 ```python
-transition == 0
+LED_REFRESH_PERIOD_SECONDS = 5
+PLOT_REFRESH_PERIOD_SECONDS = 30
+STALE_AFTER_SECONDS = 5 * 60
 ```
 
-so back-to-normal events are stored in the database but are not sent to ntfy unless this behavior is changed.
+`STALE_AFTER_SECONDS` controls when old values turn orange in the UI.
 
-Recommended ordering:
+### `STATUS_LEDS`
 
-1. Insert alarm row.
-2. Commit database transaction.
-3. Send notification.
+`STATUS_LEDS` defines the sensors shown as status cards and checked for alarm transitions:
 
-This avoids sending a notification for an alarm row that failed to commit.
+```python
+STATUS_LEDS = [
+    "secondary_temperature_1",
+    "primary_temperature_1",
+    "primary_pressure_1",
+    "secondary_flow_1",
+    "pmp07_state",
+]
+```
+
+Every sensor in `STATUS_LEDS` must exist in `SIGNAL_TABLE` and must have a `validate()` method.
+
+### `PLOTS`
+
+`PLOTS` defines the dashboard graphs. Each entry contains:
+
+- `title`: translated plot title
+- `xlabel`: translated x-axis label
+- `ylabel`: translated y-axis label
+- `signals`: list of internal sensor names
+- `legend`: optional translated trace labels
+
+For 1-minute logging and a local network dashboard, keep the maximum plot timespan at 24 hours unless SQL-side aggregation or caching is added.
+
+### `SCHEME_PLACEHOLDERS`
+
+`SCHEME_PLACEHOLDERS` maps placeholder IDs in the SVG files to sensor names:
+
+```python
+SCHEME_PLACEHOLDERS = {
+    "P001": "primary_pressure_1",
+    "T001": "gf01_temperature_out",
+    "T002": "gf02_temperature_out",
+    "T005": "primary_temperature_1",
+    "T004": "primary_temperature_2",
+    "D001": "secondary_flow_1",
+    "T006": "secondary_temperature_1",
+    "T007": "secondary_temperature_2",
+    "V001": "valve_command",
+    "S001": "gf01_state",
+    "S002": "gf02_state",
+    "S003": "pmp07_state",
+}
+```
+
+In the SVG, value text elements should use IDs such as:
+
+```xml
+<text id="scheme-value-P001">--</text>
+```
+
+Optional status markers can use IDs such as:
+
+```xml
+<circle id="scheme-status-P001" cx="100" cy="100" r="5" fill="#9ca3af" />
+```
+
+The `/api/scheme-values` endpoint returns the value, status, and color for each placeholder.
+
+## `signals.py` as the sensor configuration file
+
+`signals.py` defines the sensors known to the application. It is the main configuration file for sensor names, display descriptions, units, and validity rules.
+
+Each sensor is created from a class in `sensors.py`, then all sensors are registered in `SIGNAL_TABLE`.
+
+The internal names in `SIGNAL_TABLE` are important. They are used by:
+
+- the ingestion API payload field `sensor`
+- `STATUS_LEDS`
+- `PLOTS`
+- `SCHEME_PLACEHOLDERS`
+- rows stored in MySQL
+- alarm history
+
+### Sensor classes
+
+| Class | Purpose |
+| --- | --- |
+| `FloatSensor` | Floating-point sensor with a unit and no validation range. |
+| `FloatSensorValidRange` | Floating-point sensor with optional minimum and maximum. |
+| `StateSensor` | Integer state sensor displayed as ON/OFF, without validation. |
+| `StateSensorValid` | Integer state sensor with one valid state. |
+| `IntSensorValidValues` | Integer sensor valid only when its value is in a configured list. |
+
+### Current configured sensors
+
+| Sensor name | Type | Unit/display | Validation |
+| --- | --- | --- | --- |
+| `primary_pressure_1` | `FloatSensorValidRange` | `bar` | `2.0 <= value <= 3.5` |
+| `primary_temperature_1` | `FloatSensorValidRange` | `°C` | `value <= 14.0` |
+| `primary_temperature_2` | `FloatSensor` | `°C` | none |
+| `valve_command` | `FloatSensor` | `%` | none |
+| `pmp07_state` | `IntSensorValidValues` | ON/OFF | valid when value is `3` |
+| `gf01_state` | `StateSensor` | ON/OFF | none |
+| `gf01_temperature_out` | `FloatSensor` | `°C` | none |
+| `gf02_state` | `StateSensor` | ON/OFF | none |
+| `gf02_temperature_out` | `FloatSensor` | `°C` | none |
+| `secondary_temperature_1` | `FloatSensorValidRange` | `°C` | `value <= 18.0` |
+| `secondary_temperature_2` | `FloatSensor` | `°C` | none |
+| `secondary_flow_1` | `FloatSensorValidRange` | `L/min` | `0 <= value <= 1000` |
+
+### Adding a new sensor
+
+1. Define the sensor object in `signals.py`.
+2. Add it to `SIGNAL_TABLE` using the exact internal name that clients will post.
+3. If it should create alarm transitions and appear as a status LED, add it to `STATUS_LEDS` in `waterloop_app.py`.
+4. If it should be plotted, add it to a `PLOTS` entry.
+5. If it should appear on the SVG scheme, add it to `SCHEME_PLACEHOLDERS` and add matching IDs in both SVG files.
+
+Example:
+
+```python
+secondary_pressure_1 = sensors.FloatSensorValidRange(
+    {"en": "Secondary Pressure", "fr": "Pression secondaire"},
+    "bar",
+    1.0,
+    4.0,
+)
+
+SIGNAL_TABLE = {
+    # existing sensors...
+    "secondary_pressure_1": secondary_pressure_1,
+}
+```
+
+Then clients can post:
+
+```json
+{
+  "sensor": "secondary_pressure_1",
+  "value": "2.4"
+}
+```
+
+### Choosing validation rules
+
+Use `FloatSensorValidRange` when a value has numeric limits:
+
+```python
+sensors.FloatSensorValidRange(description, unit, min_value, max_value)
+```
+
+Use `None` for an open end:
+
+```python
+# only maximum enforced
+sensors.FloatSensorValidRange(description, "°C", None, 18.0)
+
+# only minimum enforced
+sensors.FloatSensorValidRange(description, "L/min", 10.0, None)
+```
+
+Use `IntSensorValidValues` when only specific integer states are normal:
+
+```python
+sensors.IntSensorValidValues(description, [3])
+```
+
+## Plot behavior and performance
+
+Plot data are read from `monitored_data` for the selected time range.
+
+For 1-minute logging:
+
+```text
+24 hours × 60 points/hour = 1,440 points per sensor
+```
+
+That is small enough for this app. Long ranges such as 1 week or 1 month should be avoided unless you add SQL-side aggregation or server-side caching.
+
+Recommended dashboard options for the current implementation:
+
+```python
+def make_timespan_options() -> dict[str, str]:
+    return {
+        1: "1h",
+        12: "12h",
+        24: "24h",
+    }
+```
 
 ## Alarm history page
 
@@ -746,88 +603,45 @@ The alarm page is served at:
 GET /alarms
 ```
 
-It displays recent alarm events with selectable timespans:
+It displays alarm events from the live `alarms` table with selectable timespans:
 
-- Last day
-- Last week
-- Last month
-- Last year
-- All
+- last day
+- last week
+- last month
+- last year
+- all live alarm rows
 
-The page is bilingual English/French.
-
-Rows with `transition_code > 0` are styled as active alarm transitions.
-
-Rows with `transition_code == 0` are styled as return-to-normal transitions.
+Archived rows are stored in `alarms_archive`. If you want `/alarms` to show archived history too, extend the query to include `alarms_archive`.
 
 ## Language support
 
 Translations are defined in `languages.py`.
 
-Supported languages:
+Supported UI languages:
 
 - English: `en`
 - French: `fr`
 
-Language is selected from the browser `Accept-Language` header and can be changed with dashboard buttons.
+The initial language is chosen from the browser `Accept-Language` header. The dashboard and alarm page also provide EN/FR buttons.
 
-## Running the application
+Plot titles and axis labels are configured in `PLOTS`. For localized x-axis tick formatting, set Plotly `xaxis.tickformat` and `hovertemplate` according to the selected language when building the figure.
 
-Install dependencies according to your environment, then run:
+## SVG editing workflow
 
-```bash
-python monitor_app.py
-```
+When editing the SVG files:
 
-By default the app starts on:
+- Keep placeholder IDs stable, such as `scheme-value-P001`.
+- Keep optional status IDs stable, such as `scheme-status-P001`.
+- Keep English and French SVG files aligned.
+- Do not let untrusted users upload or edit SVG templates, because they are injected into the page as HTML/SVG.
 
-```text
-http://localhost:8080
-```
+## Security notes
 
-The NiceGUI server is configured with:
+For a small trusted LAN, the app can be run directly, but the following settings are recommended:
 
-```python
-ui.run(
-    host="0.0.0.0",
-    port=8080,
-    title="WaterLoop",
-)
-```
-
-## Operational notes
-
-### Security
-
-`API_TOKEN` is disabled by default. For any deployment reachable outside a trusted network, enable token protection.
-
-A good production pattern is to load secrets from environment variables instead of hard-coding them.
-
-### Database growth
-
-`monitored_data` grows indefinitely. For long-running deployments, consider adding:
-
-- Retention cleanup.
-- Downsampling.
-- Archival.
-- Periodic vacuuming if appropriate.
-
-### SQLite concurrency
-
-SQLite is suitable for a small local monitor, but alarm transition logic can race if multiple concurrent requests update the same sensor at the same time.
-
-For stronger consistency, wrap the alarm state read/update/insert sequence in an explicit write transaction, for example using `BEGIN IMMEDIATE`.
-
-### Historical malformed rows
-
-The API should reject malformed future values. If malformed rows already exist from an older version, display/plot helpers should skip or degrade gracefully instead of crashing.
-
-## Suggested SVG editing workflow
-
-When editing the SVG in Inkscape:
-
-- Keep placeholder text element IDs stable, such as `scheme-value-P001`.
-- Optional color markers should use IDs such as `scheme-status-P001`.
-- Use “Paste in Place” to copy elements between language SVG files at the same coordinates.
-- If scaling the whole drawing, scale strokes and fonts as well.
-- Keep English and French SVG files aligned so the same placeholder IDs exist in both.
+- Set `WATERLOOP_API_TOKEN` so random LAN clients cannot inject readings.
+- Keep MySQL bound to localhost or a protected management network.
+- Use a least-privilege MySQL user.
+- Put the app behind a reverse proxy if you need HTTPS.
+- Do not commit `.env` to version control.
+- Treat ntfy topics as secrets if alarm messages reveal operational information.
