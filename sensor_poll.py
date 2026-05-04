@@ -148,7 +148,7 @@ def read_secondary_water_loop_temperature() -> dict[str, float]:
         if math.isnan(value):
             raise RuntimeError("WATER_LOOP_TEMPERATURE is nan")
 
-        return {"secondary_temperature_1": f"{value:.2f}"}
+        return {"secondary_temperature_2": f"{value:.2f}"}
 
     raise RuntimeError("WATER_LOOP_TEMPERATURE not found in sensor response")
 
@@ -225,7 +225,7 @@ async def read_opcua_measurements() -> dict[str, str]:
     client = Client(url=ENDPOINT)
     client.application_uri = APPLICATION_URI
     client.session_timeout = 60_000
-    
+
     try:
         await client.connect()
         return await read_opcua_nodes_once(client, OPCUA_NODES)

@@ -1186,20 +1186,12 @@ def dashboard_page(request: Request) -> None:
                 plot_widget.figure = make_plot_figure(
                     plot_config,
                     state["language"],
-                    state["timespan_hours"],
+                    DEFAULT_TIMESPAN_HOURS,
                 )
                 plot_widget.update()
             except Exception as exc:
                 print(f"Could not refresh plot {plot_config.get('title')}: {exc}")
 
-    def make_timespan_options() -> dict[str, str]:
-        return {
-            1 : "1h",
-            12 : "12h",
-            24 : "24h",
-            48 : "48h",
-            }
-       
 
     def refresh_language_text() -> None:
         """Update static bilingual labels and then dynamic components."""
@@ -1207,9 +1199,6 @@ def dashboard_page(request: Request) -> None:
         title_label.update()
         language_label.text = tr("language")
         language_label.update()
-        timespan_select.label = tr("timespan")
-        timespan_select.options = make_timespan_options()
-        timespan_select.update()
         alarms_button.text = tr("alarms")
         alarms_button.update()
         archive_button.text = tr("archive")
@@ -1225,10 +1214,6 @@ def dashboard_page(request: Request) -> None:
         scheme_html.update()
         refresh_scheme_values()
         refresh_language_text()
-
-    def set_timespan(event: Any) -> None:
-        state["timespan_hours"] = float(event.value)
-        refresh_plots()
 
 
     ui.add_head_html("""
@@ -1278,18 +1263,12 @@ def dashboard_page(request: Request) -> None:
                         "value": value_label,
                         "status": status_label,
                     }
-            timespan_select = ui.select(
-                make_timespan_options(),
-                value=DEFAULT_TIMESPAN_HOURS,
-                label=tr("timespan"),
-                on_change=set_timespan,
-            ).classes("w-40")
 
         # Plots
         with ui.column().classes("w-full gap-4"):
             for plot_config in PLOTS:
                 plot_widget = ui.plotly(
-                    make_plot_figure(plot_config, state["language"], state["timespan_hours"])
+                    make_plot_figure(plot_config, state["language"], DEFAULT_TIMESPAN_HOURS)
                 ).classes("w-full")
                 plot_items.append((plot_config, plot_widget))
 

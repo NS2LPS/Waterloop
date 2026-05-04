@@ -12,8 +12,7 @@ dependencies:
       - uvicorn
       - requests
       - asyncua
-      - numpy
       - mysql-connector-python
-      - ydantic-settings 
+      - pydantic-settings 
       - python-dotenv
       
