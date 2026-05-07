@@ -50,9 +50,10 @@ secondary_temperature_1 = sensors.FloatSensorValidRange(
     None,18.0,
     )
 
-secondary_temperature_2 = sensors.FloatSensor(
+secondary_temperature_2 = sensors.FloatSensorValidRange(
     {"en": "Water Loop Temperature (SEMFEG)", "fr": "Température boucle d'eau (SEMFEG)"},
     "°C",
+     None,20.0,
     )
 
 secondary_flow_1 = sensors.FloatSensorValidRange(

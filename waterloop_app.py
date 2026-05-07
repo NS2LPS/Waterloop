@@ -117,6 +117,7 @@ STALE_AFTER_SECONDS = 5 * 60
 # Grey LED: no data or no range configured.
 STATUS_LEDS = [
     "secondary_temperature_1",
+    "secondary_temperature_2",
     "primary_temperature_1",
     "primary_pressure_1",
     "secondary_flow_1",
@@ -144,8 +145,8 @@ PLOTS = [
         "title": {"en": "Loop Temperatures", "fr": "Températures des circuits"},
         "xlabel": {"en": "Time", "fr": "Temps"},
         "ylabel": {"en": "Temperature (°C)", "fr": "Température (°C)"},
-        "signals": ["primary_temperature_1", "secondary_temperature_1"],
-        "legend" : [{"en":"Primary","fr":"Primaire"},{"en":"Secondary","fr":"Secondaire"}]
+        "signals": ["primary_temperature_1", "secondary_temperature_1", "secondary_temperature_2"],
+        "legend" : [{"en":"Primary","fr":"Primaire"},{"en":"Secondary","fr":"Secondaire"},{"en":"Secondary (SEMFEG)","fr":"Secondaire (SEMFEG)"}]
     },
     # {
     #     "title": {"en": "Primary Pressure", "fr": "Pression primaire"},
