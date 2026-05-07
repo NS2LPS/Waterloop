@@ -1633,7 +1633,7 @@ def archive_page(request: Request) -> None:
     now = datetime.now(tz=LOCAL_TZ)
     today = now.date()
     default_start = datetime.fromtimestamp(
-        int(now.timestamp()) - 7 * 24 * 3600,
+        int(now.timestamp()) - 24 * 3600,
         tz=LOCAL_TZ,
     ).date()
 
