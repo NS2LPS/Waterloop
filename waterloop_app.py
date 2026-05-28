@@ -61,6 +61,7 @@ class Settings(BaseSettings):
 
     monitored_data_retention_days: int = 4
     alarms_retention_days: int = 365
+    alarm_holdoff_minutes: int = 10
     archive_rollover_period_seconds: int = 6 * 3600
     archive_batch_size: int = 10_000
 
@@ -204,6 +205,7 @@ _db_pool_lock = threading.Lock()
 # ---------------------------------------------------------------------
 MONITORED_DATA_LIVE_RETENTION_DAYS = settings.monitored_data_retention_days
 ALARMS_LIVE_RETENTION_DAYS = settings.alarms_retention_days
+ALARM_HOLDOFF_SECONDS = max(0, settings.alarm_holdoff_minutes) * 60
 ARCHIVE_ROLLOVER_PERIOD_SECONDS = settings.archive_rollover_period_seconds
 ARCHIVE_BATCH_SIZE = settings.archive_batch_size
 
@@ -626,6 +628,27 @@ def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int,
     thread.start()
 
 
+def should_store_alarm_transition(
+    transition: int,
+    timestamp: int,
+    last_alarm_row: Optional[tuple[Any, ...]],
+) -> bool:
+    """Return whether an alarm transition should be recorded."""
+    if last_alarm_row is None:
+        return True
+
+    last_timestamp = int(last_alarm_row[0])
+    last_transition = int(last_alarm_row[1])
+
+    if transition == 0:
+        return last_transition != 0
+
+    if ALARM_HOLDOFF_SECONDS <= 0:
+        return True
+
+    return timestamp - last_timestamp >= ALARM_HOLDOFF_SECONDS
+
+
 def check_for_alarm_in_transaction(
     cursor,
     sensor_name: str,
@@ -692,6 +715,24 @@ def check_for_alarm_in_transaction(
     )
 
     if transition is not None and acknowledged is not None:
+        cursor.execute(
+            """
+            SELECT `timestamp`, transition
+            FROM alarms
+            WHERE sensor = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (sensor_name,),
+        )
+
+        if not should_store_alarm_transition(
+            transition=transition,
+            timestamp=timestamp,
+            last_alarm_row=cursor.fetchone(),
+        ):
+            return None
+
         cursor.execute(
             """
             INSERT INTO alarms (`timestamp`, sensor, value, transition, acknowledged)

@@ -86,6 +86,7 @@ WATERLOOP_NTFY_PRIORITY=urgent
 | `WATERLOOP_DB_NAME` | `waterloop` | MySQL database name. |
 | `WATERLOOP_CREATE_DATABASE_IF_NEEDED` | `true` | If true, the app tries to create the database at startup. |
 | `WATERLOOP_DB_POOL_SIZE` | `10` | Number of MySQL connections in the application pool. |
+| `WATERLOOP_ALARM_HOLDOFF_MINUTES` | `10` | Minimum delay before recording or notifying another alarm event for the same sensor. |
 
 For production or semi-production use, prefer creating the database manually and granting only the required privileges to the application user. Then set:
 
@@ -369,6 +370,8 @@ Typical behavior:
 | non-zero | `0` | Insert back-to-normal event. |
 | `1` | `2` | Insert alarm-type-change event. |
 | same state | same state | Update latest timestamp/value; no duplicate alarm event. |
+
+Alarm retriggering is limited by `WATERLOOP_ALARM_HOLDOFF_MINUTES`, which defaults to 10 minutes. During the holdoff window, new active alarm transitions for the same sensor are suppressed, but live sensor state is still updated. Suppressed transitions do not create MySQL alarm rows and do not send ntfy notifications. Back-to-normal rows are only stored when the latest stored alarm event for that sensor is active.
 
 Important: stale/no-data display state is determined from `last_timestamp`. Unless you add a dedicated stale-alarm checker, a sensor that stops sending data becomes visually stale but does not automatically create a new alarm row or ntfy notification.
 
