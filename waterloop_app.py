@@ -61,7 +61,7 @@ class Settings(BaseSettings):
 
     monitored_data_retention_days: int = 4
     alarms_retention_days: int = 365
-    alarm_holdoff_minutes: int = 10
+    alarm_holdoff_minutes: int = 30
     archive_rollover_period_seconds: int = 6 * 3600
     archive_batch_size: int = 10_000
 
