@@ -5,7 +5,7 @@ import sensors
 primary_pressure_1 = sensors.FloatSensorValidRange(
     {"en": "Primary Circuit Pressure", "fr": "Pression primaire"},
     "bar",
-    2.0,3.5,
+    1.5,3.5,
     )
 
 primary_temperature_1 = sensors.FloatSensorValidRange(
@@ -50,10 +50,9 @@ secondary_temperature_1 = sensors.FloatSensorValidRange(
     None,18.0,
     )
 
-secondary_temperature_2 = sensors.FloatSensorValidRange(
+secondary_temperature_2 = sensors.FloatSensor(
     {"en": "Water Loop Temperature (SEMFEG)", "fr": "Température boucle d'eau (SEMFEG)"},
     "°C",
-     None,20.0,
     )
 
 secondary_flow_1 = sensors.FloatSensorValidRange(
