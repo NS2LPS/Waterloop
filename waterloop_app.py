@@ -118,7 +118,7 @@ STALE_AFTER_SECONDS = 5 * 60
 # Grey LED: no data or no range configured.
 STATUS_LEDS = [
     "secondary_temperature_1",
-    "secondary_temperature_2",
+#    "secondary_temperature_2",
     "primary_temperature_1",
     "primary_pressure_1",
     "secondary_flow_1",
