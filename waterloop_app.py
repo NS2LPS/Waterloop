@@ -1873,6 +1873,11 @@ def archive_page(request: Request) -> None:
         shared_x_range = state.get("shared_x_range")
         if shared_x_range is not None:
             xaxis_options["range"] = shared_x_range
+        elif start_timestamp is not None and end_timestamp is not None:
+            xaxis_options["range"] = [
+                datetime.fromtimestamp(start_timestamp, tz=LOCAL_TZ),
+                datetime.fromtimestamp(end_timestamp, tz=LOCAL_TZ),
+            ]
 
         figure.update_layout(
             title=SIGNAL_TABLE[sensor_name].description(LANGUAGE),
