@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 POLL_PERIOD_SECONDS = 60
 SECONDARY_WATER_LOOP_URL = "http://adm-uc-a.lps.u-psud.fr/data"
+SECONDARY_WATER_LOOP_FLOW_URL = "http://adm-uc-b.lps.u-psud.fr/data"
 PRIMARY_PRESSURE_URL = "http://192.168.142.126:8080"
 
 # NiceGUI/FastAPI monitor app POST endpoint.
@@ -153,6 +154,75 @@ def read_secondary_water_loop_temperature() -> dict[str, float]:
 
     raise RuntimeError("WATER_LOOP_TEMPERATURE not found in sensor response")
 
+ 
+
+def read_secondary_water_loop_flow() -> dict[str, float]:
+    """
+    Poll the secondary water-loop flow from an HTTP endpoint.
+
+    Returns:
+        {
+            "secondary_flow_1": 128.1
+        }
+
+    Raises:
+        RuntimeError if the HTTP request fails, the field is missing,
+        or the value is invalid.
+    """
+    http_request = urlrequest.Request(
+        SECONDARY_WATER_LOOP_FLOW_URL,
+        headers={
+            "User-Agent": "WaterLoopMonitor/1.0",
+            "Connection": "close",
+        },
+    )
+
+    try:
+        with urlrequest.urlopen(http_request, timeout=5) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"HTTP error while reading secondary water-loop flow: "
+            f"{exc.code} {exc.reason}"
+        ) from exc
+
+    except URLError as exc:
+        raise RuntimeError(
+            f"Network error while reading secondary water-loop flow: "
+            f"{exc.reason}"
+        ) from exc
+
+    except ConnectionResetError as exc:
+        raise RuntimeError(
+            "Connection reset by peer while reading secondary water-loop flow"
+        ) from exc
+
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "Timeout while reading secondary water-loop flow"
+        ) from exc
+
+    for item in response_text.split():
+        if not item.startswith("WATER_LOOP_FLOW:"):
+            continue
+
+        _, value_text = item.split(":", maxsplit=1)
+
+        try:
+            value = float(value_text)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid WATER_LOOP_FLOW value: {value_text!r}"
+            ) from exc
+
+        if math.isnan(value):
+            raise RuntimeError("WATER_LOOP_FLOW is nan")
+
+        return {"secondary_flow_1": f"{value:.2f}"}
+
+    raise RuntimeError("WATER_LOOP_FLOW not found in sensor response")
+   
 
 def read_primary_pressure() -> dict[str, float]:
     """
@@ -359,6 +429,12 @@ def collect_measurements() -> dict[str, str]:
     # Read SEMFEG water loop temperature
     try:
         values.update(read_secondary_water_loop_temperature())
+    except Exception as exc:
+        print(f"HTTP polling error: {exc}")
+
+    # Read water loop flow
+    try:
+        values.update(read_secondary_water_loop_flow())
     except Exception as exc:
         print(f"HTTP polling error: {exc}")
 
