@@ -150,12 +150,12 @@ PLOTS = [
         "signals": ["primary_temperature_1", "secondary_temperature_1", "secondary_temperature_2"],
         "legend" : [{"en":"Primary","fr":"Primaire"},{"en":"Secondary","fr":"Secondaire"},{"en":"Secondary (SEMFEG)","fr":"Secondaire (SEMFEG)"}]
     },
-    {
-        "title": {"en": "Primary Pressure", "fr": "Pression primaire"},
-         "xlabel": {"en": "Time", "fr": "Temps"},
-         "ylabel": {"en": "Pressure (bar)", "fr": "Pression (bar)"},
-         "signals": ["primary_pressure_1"],
-     },
+    #{
+    #    "title": {"en": "Primary Pressure", "fr": "Pression primaire"},
+    #     "xlabel": {"en": "Time", "fr": "Temps"},
+    #     "ylabel": {"en": "Pressure (bar)", "fr": "Pression (bar)"},
+    #     "signals": ["primary_pressure_1"],
+    # },
     # {
     #     "title": {"en": "Secondary Flow", "fr": "Débit secondaire"},
     #     "xlabel": {"en": "Time", "fr": "Temps"},
