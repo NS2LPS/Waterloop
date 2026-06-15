@@ -1681,6 +1681,8 @@ def archive_page(request: Request) -> None:
     state: dict[str, Any] = {
         "start_date": default_start.isoformat(),
         "end_date": today.isoformat(),
+        "shared_x_range": None,
+        "syncing_x_range": False,
     }
 
     plot_items: list[dict[str, Any]] = []
@@ -1779,15 +1781,58 @@ def archive_page(request: Request) -> None:
         sensor = SIGNAL_TABLE[sensor_name]
 
         for timestamp, value_str in rows:
+            point_timestamp = int(timestamp)
             try:
-                points.append((int(timestamp), sensor.value(value_str)))
+                points.append((point_timestamp, sensor.value(value_str)))
             except Exception as exc:
                 print(
-                    f"Skipping invalid archived row for sensor={sensor_name!r}, "
+                    f"Using NaN for invalid archived row sensor={sensor_name!r}, "
                     f"timestamp={timestamp!r}, value={value_str!r}: {exc}"
                 )
+                points.append((point_timestamp, math.nan))
 
         return points
+
+    def fill_missing_archive_points(
+        points: list[tuple[int, float]],
+    ) -> list[tuple[int, float]]:
+        """Insert NaN samples where a regular archive series has missing rows."""
+        if len(points) < 3:
+            return sorted(points)
+
+        sorted_points = sorted(points)
+        deltas = [
+            current_timestamp - previous_timestamp
+            for (previous_timestamp, _), (current_timestamp, _) in zip(
+                sorted_points,
+                sorted_points[1:],
+            )
+            if current_timestamp > previous_timestamp
+        ]
+        if not deltas:
+            return sorted_points
+
+        expected_delta = sorted(deltas)[len(deltas) // 2]
+        if expected_delta <= 0:
+            return sorted_points
+
+        gap_threshold = expected_delta * 1.5
+        filled_points: list[tuple[int, float]] = [sorted_points[0]]
+
+        for previous_point, current_point in zip(sorted_points, sorted_points[1:]):
+            previous_timestamp = previous_point[0]
+            current_timestamp = current_point[0]
+            gap = current_timestamp - previous_timestamp
+
+            if gap > gap_threshold:
+                missing_timestamp = previous_timestamp + expected_delta
+                while missing_timestamp < current_timestamp:
+                    filled_points.append((missing_timestamp, math.nan))
+                    missing_timestamp += expected_delta
+
+            filled_points.append(current_point)
+
+        return filled_points
 
     def make_archive_figure(sensor_name: str) -> go.Figure:
         """Build one archived signal Plotly figure."""
@@ -1803,6 +1848,7 @@ def archive_page(request: Request) -> None:
                 start_timestamp=start_timestamp,
                 end_timestamp=end_timestamp,
             )
+            points = fill_missing_archive_points(points)
 
         x_values = [
             datetime.fromtimestamp(timestamp, tz=LOCAL_TZ)
@@ -1815,9 +1861,18 @@ def archive_page(request: Request) -> None:
                 x=x_values,
                 y=y_values,
                 mode="lines",
+                connectgaps=False,
                 hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y}<extra></extra>",
             )
         )
+
+        xaxis_options: dict[str, Any] = {
+            "tickformat": "%Y-%m-%d<br>%H:%M",
+            "hoverformat": "%Y-%m-%d %H:%M:%S",
+        }
+        shared_x_range = state.get("shared_x_range")
+        if shared_x_range is not None:
+            xaxis_options["range"] = shared_x_range
 
         figure.update_layout(
             title=SIGNAL_TABLE[sensor_name].description(LANGUAGE),
@@ -1825,24 +1880,57 @@ def archive_page(request: Request) -> None:
             yaxis_title=yaxis_label(sensor_name),
             margin={"l": 60, "r": 20, "t": 50, "b": 50},
             showlegend=False,
-            xaxis={
-                "tickformat": "%Y-%m-%d<br>%H:%M",
-                "hoverformat": "%Y-%m-%d %H:%M:%S",
-            },
+            xaxis=xaxis_options,
             template="plotly_white",
             height=360,
         )
 
         return figure
 
+    def relayout_payload(event: Any) -> dict[str, Any]:
+        """Return Plotly relayout data from NiceGUI event arguments."""
+        args = getattr(event, "args", {})
+        if isinstance(args, dict):
+            return args
+        if isinstance(args, list) and args and isinstance(args[0], dict):
+            return args[0]
+        return {}
+
     def refresh_plot(plot_state: dict[str, Any]) -> None:
         sensor_name = str(plot_state["select"].value)
         plot_state["figure"].figure = make_archive_figure(sensor_name)
         plot_state["figure"].update()
 
+    def sync_x_range_from_plot(event: Any, source_plot: dict[str, Any]) -> None:
+        if state["syncing_x_range"]:
+            return
+
+        payload = relayout_payload(event)
+        next_range = state.get("shared_x_range")
+
+        if "xaxis.range[0]" in payload and "xaxis.range[1]" in payload:
+            next_range = [payload["xaxis.range[0]"], payload["xaxis.range[1]"]]
+        elif payload.get("xaxis.autorange") is True:
+            next_range = None
+        else:
+            return
+
+        if next_range == state.get("shared_x_range"):
+            return
+
+        state["shared_x_range"] = next_range
+        state["syncing_x_range"] = True
+        try:
+            for plot_state in list(plot_items):
+                if plot_state is not source_plot:
+                    refresh_plot(plot_state)
+        finally:
+            state["syncing_x_range"] = False
+
     def refresh_all_plots() -> None:
         state["start_date"] = str(start_date_input.value)
         state["end_date"] = str(end_date_input.value)
+        state["shared_x_range"] = None
 
         for plot_state in list(plot_items):
             refresh_plot(plot_state)
@@ -1890,6 +1978,10 @@ def archive_page(request: Request) -> None:
             signal_select.on(
                 "update:model-value",
                 lambda _event, item=plot_state: refresh_plot(item),
+            )
+            plot_widget.on(
+                "plotly_relayout",
+                lambda event, item=plot_state: sync_x_range_from_plot(event, item),
             )
             remove_button.on_click(lambda item=plot_state: remove_plot(item))
 
