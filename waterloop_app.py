@@ -107,6 +107,8 @@ API_TOKEN = settings.api_token
 # Plots refresh less frequently to avoid unnecessary browser work.
 LED_REFRESH_PERIOD_SECONDS = 5
 PLOT_REFRESH_PERIOD_SECONDS = 30
+ARCHIVE_MISSING_DATA_INTERVAL_SECONDS = 60
+ARCHIVE_MISSING_DATA_GAP_FACTOR = 2
 # If the latest value is older than this, the LED becomes orange.
 STALE_AFTER_SECONDS = 5 * 60
 
@@ -1798,26 +1800,15 @@ def archive_page(request: Request) -> None:
         points: list[tuple[int, float]],
     ) -> list[tuple[int, float]]:
         """Insert NaN samples where a regular archive series has missing rows."""
-        if len(points) < 3:
+        if len(points) < 2:
             return sorted(points)
 
         sorted_points = sorted(points)
-        deltas = [
-            current_timestamp - previous_timestamp
-            for (previous_timestamp, _), (current_timestamp, _) in zip(
-                sorted_points,
-                sorted_points[1:],
-            )
-            if current_timestamp > previous_timestamp
-        ]
-        if not deltas:
-            return sorted_points
-
-        expected_delta = sorted(deltas)[len(deltas) // 2]
+        expected_delta = ARCHIVE_MISSING_DATA_INTERVAL_SECONDS
         if expected_delta <= 0:
             return sorted_points
 
-        gap_threshold = expected_delta * 1.5
+        gap_threshold = expected_delta * ARCHIVE_MISSING_DATA_GAP_FACTOR
         filled_points: list[tuple[int, float]] = [sorted_points[0]]
 
         for previous_point, current_point in zip(sorted_points, sorted_points[1:]):
