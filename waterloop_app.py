@@ -1736,6 +1736,7 @@ def archive_page(request: Request) -> None:
             59,
             tzinfo=LOCAL_TZ,
         )
+        end_dt = min(end_dt, datetime.now(tz=LOCAL_TZ))
 
         return int(start_dt.timestamp()), int(end_dt.timestamp())
 
