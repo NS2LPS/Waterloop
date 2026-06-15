@@ -5,7 +5,7 @@ import sensors
 primary_pressure_1 = sensors.FloatSensorValidRange(
     {"en": "Primary Circuit Pressure", "fr": "Pression primaire"},
     "bar",
-    1.5,None,
+    1.8,None,
     )
 
 primary_temperature_1 = sensors.FloatSensorValidRange(
