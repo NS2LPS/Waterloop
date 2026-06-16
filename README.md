@@ -86,6 +86,7 @@ WATERLOOP_NTFY_PRIORITY=urgent
 | `WATERLOOP_DB_NAME` | `waterloop` | MySQL database name. |
 | `WATERLOOP_CREATE_DATABASE_IF_NEEDED` | `true` | If true, the app tries to create the database at startup. |
 | `WATERLOOP_DB_POOL_SIZE` | `10` | Number of MySQL connections in the application pool. |
+| `WATERLOOP_ALARM_MIN_CONSECUTIVE_OUT_OF_BOUNDS` | `3` | Number of consecutive out-of-range readings required before creating an alarm event. |
 | `WATERLOOP_ALARM_HOLDOFF_MINUTES` | `10` | Minimum delay before recording or notifying another alarm event for the same sensor. |
 
 For production or semi-production use, prefer creating the database manually and granting only the required privileges to the application user. Then set:
@@ -365,11 +366,13 @@ Typical behavior:
 | Previous state | New state | DB behavior |
 | ---: | ---: | --- |
 | none | `0` | Initialize state; no alarm event. |
-| none | non-zero | Initialize state; insert alarm event. |
-| `0` | non-zero | Insert alarm event. |
+| none | non-zero | Initialize state; insert alarm event only when the consecutive out-of-range threshold is reached. |
+| `0` | non-zero | Insert alarm event only when the consecutive out-of-range threshold is reached. |
 | non-zero | `0` | Insert back-to-normal event. |
-| `1` | `2` | Insert alarm-type-change event. |
+| `1` | `2` | Insert alarm-type-change event only when the consecutive out-of-range threshold is reached for the new state. |
 | same state | same state | Update latest timestamp/value; no duplicate alarm event. |
+
+Alarm creation is delayed until the same sensor has at least `WATERLOOP_ALARM_MIN_CONSECUTIVE_OUT_OF_BOUNDS` consecutive readings with the same non-zero validation state. The default is 3, so one or two out-of-range readings are stored and shown as the latest state, but they do not create an alarm row or ntfy notification by themselves.
 
 Alarm retriggering is limited by `WATERLOOP_ALARM_HOLDOFF_MINUTES`, which defaults to 10 minutes. During the holdoff window, new active alarm transitions for the same sensor are suppressed, but live sensor state is still updated. Suppressed transitions do not create MySQL alarm rows and do not send ntfy notifications. Back-to-normal rows are only stored when the latest stored alarm event for that sensor is active.
 

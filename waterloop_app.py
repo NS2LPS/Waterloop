@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     monitored_data_retention_days: int = 4
     alarms_retention_days: int = 365
     alarm_holdoff_minutes: int = 10
+    alarm_min_consecutive_out_of_bounds: int = 3
     archive_rollover_period_seconds: int = 6 * 3600
     archive_batch_size: int = 10_000
 
@@ -207,6 +208,7 @@ _db_pool_lock = threading.Lock()
 MONITORED_DATA_LIVE_RETENTION_DAYS = settings.monitored_data_retention_days
 ALARMS_LIVE_RETENTION_DAYS = settings.alarms_retention_days
 ALARM_HOLDOFF_SECONDS = max(0, settings.alarm_holdoff_minutes) * 60
+ALARM_MIN_CONSECUTIVE_OUT_OF_BOUNDS = max(1, settings.alarm_min_consecutive_out_of_bounds)
 ARCHIVE_ROLLOVER_PERIOD_SECONDS = settings.archive_rollover_period_seconds
 ARCHIVE_BATCH_SIZE = settings.archive_batch_size
 
@@ -629,6 +631,44 @@ def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int,
     thread.start()
 
 
+def count_consecutive_out_of_bounds_readings(cursor, sensor_name: str, new_state: int) -> int:
+    """Count latest consecutive readings with the same out-of-bounds state."""
+    if new_state == 0:
+        return 0
+
+    sensor = SIGNAL_TABLE[sensor_name]
+    cursor.execute(
+        """
+        SELECT value
+        FROM monitored_data
+        WHERE sensor = %s
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (sensor_name, ALARM_MIN_CONSECUTIVE_OUT_OF_BOUNDS + 1),
+    )
+
+    count = 0
+    for (stored_value,) in cursor.fetchall():
+        try:
+            if sensor.validate(sensor.value(stored_value)) != new_state:
+                break
+        except Exception:
+            break
+        count += 1
+
+    return count
+
+
+def alarm_threshold_crossed(cursor, sensor_name: str, new_state: int) -> bool:
+    """Return true on the reading where the alarm threshold is reached."""
+    return (
+        new_state != 0
+        and count_consecutive_out_of_bounds_readings(cursor, sensor_name, new_state)
+        == ALARM_MIN_CONSECUTIVE_OUT_OF_BOUNDS
+    )
+
+
 def should_store_alarm_transition(
     transition: int,
     timestamp: int,
@@ -636,7 +676,7 @@ def should_store_alarm_transition(
 ) -> bool:
     """Return whether an alarm transition should be recorded."""
     if last_alarm_row is None:
-        return True
+        return transition != 0
 
     last_timestamp = int(last_alarm_row[0])
     last_transition = int(last_alarm_row[1])
@@ -692,16 +732,12 @@ def check_for_alarm_in_transaction(
     acknowledged: Optional[int] = None
 
     if is_alarm_sensor:
-        # First bad reading creates an alarm.
-        if previous_state is None:
-            if new_state != 0:
-                transition = new_state
-                acknowledged = 0
-
-        # Later state changes create alarm or back-to-normal events.
-        elif previous_state != new_state:
+        if new_state == 0 and previous_state not in (None, 0):
+            transition = 0
+            acknowledged = 1
+        elif new_state != 0 and alarm_threshold_crossed(cursor, sensor_name, new_state):
             transition = new_state
-            acknowledged = 1 if new_state == 0 else 0
+            acknowledged = 0
 
     cursor.execute(
         """
