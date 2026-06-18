@@ -110,6 +110,7 @@ LED_REFRESH_PERIOD_SECONDS = 5
 PLOT_REFRESH_PERIOD_SECONDS = 30
 ARCHIVE_MISSING_DATA_INTERVAL_SECONDS = 60
 ARCHIVE_MISSING_DATA_GAP_FACTOR = 2
+MAX_ARCHIVE_PLOT_POINTS = 2000
 # If the latest value is older than this, the LED becomes orange.
 STALE_AFTER_SECONDS = 5 * 60
 
@@ -1778,40 +1779,168 @@ def archive_page(request: Request) -> None:
 
         return int(start_dt.timestamp()), int(end_dt.timestamp())
 
+    def parse_plotly_timestamp(value: Any) -> Optional[int]:
+        """Convert a Plotly x-axis value to a local Unix timestamp."""
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            value_str = str(value).strip()
+            if not value_str:
+                return None
+
+            if value_str.endswith("Z"):
+                value_str = f"{value_str[:-1]}+00:00"
+
+            try:
+                dt = datetime.fromisoformat(value_str)
+            except ValueError:
+                try:
+                    dt = datetime.strptime(value_str, "%Y-%m-%d %H:%M:%S.%f")
+                except ValueError:
+                    try:
+                        dt = datetime.strptime(value_str, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        else:
+            dt = dt.astimezone(LOCAL_TZ)
+
+        return int(dt.timestamp())
+
+    def visible_timestamp_window() -> tuple[Optional[int], Optional[int]]:
+        """Return the zoomed timestamp window, falling back to the selected dates."""
+        selected_start, selected_end = parse_day_window()
+        shared_x_range = state.get("shared_x_range")
+
+        if shared_x_range is None:
+            return selected_start, selected_end
+
+        if not isinstance(shared_x_range, list) or len(shared_x_range) != 2:
+            return selected_start, selected_end
+
+        visible_start = parse_plotly_timestamp(shared_x_range[0])
+        visible_end = parse_plotly_timestamp(shared_x_range[1])
+        if visible_start is None or visible_end is None:
+            return selected_start, selected_end
+
+        if selected_start is not None:
+            visible_start = max(visible_start, selected_start)
+        if selected_end is not None:
+            visible_end = min(visible_end, selected_end)
+
+        if visible_end < visible_start:
+            return selected_start, selected_end
+
+        return visible_start, visible_end
+
+    def archive_bucket_seconds(start_timestamp: int, end_timestamp: int) -> int:
+        """Choose zero for raw rows or a SQL aggregation bucket size in seconds."""
+        range_seconds = max(1, end_timestamp - start_timestamp)
+        raw_interval = max(1, ARCHIVE_MISSING_DATA_INTERVAL_SECONDS)
+
+        if range_seconds / raw_interval <= MAX_ARCHIVE_PLOT_POINTS:
+            return 0
+
+        for bucket_seconds in (
+            5 * 60,
+            15 * 60,
+            30 * 60,
+            60 * 60,
+            3 * 60 * 60,
+            6 * 60 * 60,
+            12 * 60 * 60,
+            24 * 60 * 60,
+            7 * 24 * 60 * 60,
+        ):
+            if range_seconds / bucket_seconds <= MAX_ARCHIVE_PLOT_POINTS:
+                return bucket_seconds
+
+        return 30 * 24 * 60 * 60
+
     def get_archive_sensor_points(
         sensor_name: str,
         start_timestamp: int,
         end_timestamp: int,
+        bucket_seconds: int,
     ) -> list[tuple[int, float]]:
-        """Fetch all archived points for one sensor and selected day window."""
+        """Fetch raw or SQL-aggregated archived points for one sensor."""
         points: list[tuple[int, float]] = []
 
         try:
             with db_connection() as connection:
                 with closing(connection.cursor()) as cursor:
-                    cursor.execute(
-                        f"""
-                        SELECT `timestamp`, value
-                        FROM {ARCHIVE_TABLE}
-                        WHERE sensor = %s
-                          AND `timestamp` BETWEEN %s AND %s
-                        ORDER BY `timestamp`
-                        """,
-                        (sensor_name, start_timestamp, end_timestamp),
-                    )
-                    rows = cursor.fetchall()
+                    if bucket_seconds <= 0:
+                        cursor.execute(
+                            f"""
+                            SELECT `timestamp`, value
+                            FROM (
+                                SELECT `timestamp`, value
+                                FROM {ARCHIVE_TABLE}
+                                WHERE sensor = %s
+                                  AND `timestamp` BETWEEN %s AND %s
 
-                    cursor.execute(
-                        f"""
-                        SELECT `timestamp`, value
-                        FROM {CURRENT_TABLE}
-                        WHERE sensor = %s
-                        AND `timestamp` BETWEEN %s AND %s
-                        ORDER BY `timestamp`
-                        """,
-                        (sensor_name, start_timestamp, end_timestamp),
-                    )
-                    rows += cursor.fetchall()
+                                UNION ALL
+
+                                SELECT `timestamp`, value
+                                FROM {CURRENT_TABLE}
+                                WHERE sensor = %s
+                                  AND `timestamp` BETWEEN %s AND %s
+                            ) rows_for_plot
+                            ORDER BY `timestamp`
+                            """,
+                            (
+                                sensor_name,
+                                start_timestamp,
+                                end_timestamp,
+                                sensor_name,
+                                start_timestamp,
+                                end_timestamp,
+                            ),
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            SELECT bucket_timestamp, AVG(numeric_value) AS value
+                            FROM (
+                                SELECT
+                                    FLOOR(`timestamp` / %s) * %s AS bucket_timestamp,
+                                    CAST(value AS DECIMAL(20, 6)) AS numeric_value
+                                FROM {ARCHIVE_TABLE}
+                                WHERE sensor = %s
+                                  AND `timestamp` BETWEEN %s AND %s
+
+                                UNION ALL
+
+                                SELECT
+                                    FLOOR(`timestamp` / %s) * %s AS bucket_timestamp,
+                                    CAST(value AS DECIMAL(20, 6)) AS numeric_value
+                                FROM {CURRENT_TABLE}
+                                WHERE sensor = %s
+                                  AND `timestamp` BETWEEN %s AND %s
+                            ) rows_for_plot
+                            GROUP BY bucket_timestamp
+                            ORDER BY bucket_timestamp
+                            """,
+                            (
+                                bucket_seconds,
+                                bucket_seconds,
+                                sensor_name,
+                                start_timestamp,
+                                end_timestamp,
+                                bucket_seconds,
+                                bucket_seconds,
+                                sensor_name,
+                                start_timestamp,
+                                end_timestamp,
+                            ),
+                        )
+
+                    rows = cursor.fetchall()
 
         except MySQLError as exc:
             print(f"Could not fetch archived plot data for {sensor_name!r}: {exc}")
@@ -1834,13 +1963,13 @@ def archive_page(request: Request) -> None:
 
     def fill_missing_archive_points(
         points: list[tuple[int, float]],
+        expected_delta: int,
     ) -> list[tuple[int, float]]:
         """Insert NaN samples where a regular archive series has missing rows."""
         if len(points) < 2:
             return sorted(points)
 
         sorted_points = sorted(points)
-        expected_delta = ARCHIVE_MISSING_DATA_INTERVAL_SECONDS
         if expected_delta <= 0:
             return sorted_points
 
@@ -1864,19 +1993,26 @@ def archive_page(request: Request) -> None:
 
     def make_archive_figure(sensor_name: str) -> go.Figure:
         """Build one archived signal Plotly figure."""
-        start_timestamp, end_timestamp = parse_day_window()
+        selected_start, selected_end = parse_day_window()
+        start_timestamp, end_timestamp = visible_timestamp_window()
 
         figure = go.Figure()
+        bucket_seconds = 0
 
         if start_timestamp is None or end_timestamp is None:
             points = []
         else:
+            bucket_seconds = archive_bucket_seconds(start_timestamp, end_timestamp)
             points = get_archive_sensor_points(
                 sensor_name=sensor_name,
                 start_timestamp=start_timestamp,
                 end_timestamp=end_timestamp,
+                bucket_seconds=bucket_seconds,
             )
-            points = fill_missing_archive_points(points)
+            points = fill_missing_archive_points(
+                points,
+                expected_delta=bucket_seconds or ARCHIVE_MISSING_DATA_INTERVAL_SECONDS,
+            )
 
         x_values = [
             datetime.fromtimestamp(timestamp, tz=LOCAL_TZ)
@@ -1901,10 +2037,10 @@ def archive_page(request: Request) -> None:
         shared_x_range = state.get("shared_x_range")
         if shared_x_range is not None:
             xaxis_options["range"] = shared_x_range
-        elif start_timestamp is not None and end_timestamp is not None:
+        elif selected_start is not None and selected_end is not None:
             xaxis_options["range"] = [
-                datetime.fromtimestamp(start_timestamp, tz=LOCAL_TZ),
-                datetime.fromtimestamp(end_timestamp, tz=LOCAL_TZ),
+                datetime.fromtimestamp(selected_start, tz=LOCAL_TZ),
+                datetime.fromtimestamp(selected_end, tz=LOCAL_TZ),
             ]
 
         figure.update_layout(
@@ -1943,6 +2079,8 @@ def archive_page(request: Request) -> None:
 
         if "xaxis.range[0]" in payload and "xaxis.range[1]" in payload:
             next_range = [payload["xaxis.range[0]"], payload["xaxis.range[1]"]]
+        elif "xaxis.range" in payload and isinstance(payload["xaxis.range"], list):
+            next_range = payload["xaxis.range"]
         elif payload.get("xaxis.autorange") is True:
             next_range = None
         else:
@@ -1955,8 +2093,7 @@ def archive_page(request: Request) -> None:
         state["syncing_x_range"] = True
         try:
             for plot_state in list(plot_items):
-                if plot_state is not source_plot:
-                    refresh_plot(plot_state)
+                refresh_plot(plot_state)
         finally:
             state["syncing_x_range"] = False
 
