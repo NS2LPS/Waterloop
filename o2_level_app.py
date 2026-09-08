@@ -4,7 +4,6 @@ Uses the existing WATERLOOP_DB_* settings and .env file. Historical data is
 written by sensor_poll.py and the monitor API; this app only reads it.
 Optional settings: WATERLOOP_O2_POLL_PERIOD_SECONDS (10),
 WATERLOOP_O2_PLOT_PERIOD_SECONDS (30), WATERLOOP_O2_PORT (8081).
-The same pages can be hosted by waterloop_app via register_pages("/o2").
 """
 
 import logging
@@ -151,7 +150,8 @@ async def update_history(plot, status, start: int, end: int) -> None:
         )
 
 
-def main_page(archive_url: str = "/archive") -> None:
+@ui.page("/")
+def main_page() -> None:
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-6"):
         ui.label("Oxygen level in the helium line").classes("text-3xl font-semibold")
         with ui.card().classes("w-full items-center p-8"):
@@ -172,7 +172,7 @@ def main_page(archive_url: str = "/archive") -> None:
             now = int(datetime.now(LOCAL_TZ).timestamp())
             plot = ui.plotly(make_figure([], [], now - 86400, now)).classes("w-full")
             history_status = ui.label("Loading readings…").classes("text-sm text-slate-500")
-        ui.button("Archive", icon="history", on_click=lambda: ui.navigate.to(archive_url))
+        ui.button("Archive", icon="history", on_click=lambda: ui.navigate.to("/archive"))
 
     async def refresh_live() -> None:
         try:
@@ -207,11 +207,12 @@ def parse_archive_window(start_text: str, end_text: str) -> tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
-def archive_page(live_url: str = "/") -> None:
+@ui.page("/archive")
+def archive_page() -> None:
     now = datetime.now(LOCAL_TZ).replace(second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
-        ui.button("Live display", icon="arrow_back", on_click=lambda: ui.navigate.to(live_url)).props("flat")
+        ui.button("Live display", icon="arrow_back", on_click=lambda: ui.navigate.to("/")).props("flat")
         ui.label("Oxygen history").classes("text-3xl font-semibold")
         ui.label("Oxygen level in the helium line · ppm").classes("text-slate-500")
         with ui.row().classes("items-end gap-4"):
@@ -238,20 +239,5 @@ def archive_page(live_url: str = "/") -> None:
     ui.timer(0.1, refresh, once=True)
 
 
-def register_pages(prefix: str = "") -> None:
-    """Register standalone or embedded pages without replacing the host's routes."""
-    live_url = prefix.rstrip("/") or "/"
-    archive_url = f"{prefix.rstrip('/')}/archive"
-
-    @ui.page(live_url)
-    def oxygen_live_page() -> None:
-        main_page(archive_url=archive_url)
-
-    @ui.page(archive_url)
-    def oxygen_archive_page() -> None:
-        archive_page(live_url=live_url)
-
-
 if __name__ in {"__main__", "__mp_main__"}:
-    register_pages()
     ui.run(host="0.0.0.0", port=settings.o2_port, title="Helium Oxygen Monitor", reload=False)

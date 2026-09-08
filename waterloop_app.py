@@ -23,7 +23,6 @@ from nicegui import ui, app
 
 # Sensors and signals
 from signals import SIGNAL_TABLE
-from o2_level_app import register_pages as register_oxygen_pages
 
 # Translation table
 from languages import translate
@@ -2271,8 +2270,6 @@ def startup() -> None:
     refresh_sensor_description_table()
     archive_old_rows_if_due(force=True)
     
-register_oxygen_pages("/o2")
-
 app.on_startup(startup)
 
 if __name__ in {"__main__", "__mp_main__"}:

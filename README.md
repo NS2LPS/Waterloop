@@ -296,13 +296,6 @@ For HTTPS, the recommended deployment is to run NiceGUI on `127.0.0.1:8080` and 
 
 ## Standalone oxygen display
 
-The water-loop app serves the live oxygen page directly at `/o2` and its archive
-at `/o2/archive` through the existing water-loop port (8080), without adding a
-dashboard button. Deploy `waterloop_app.py` and `o2_level_app.py` together and
-restart the water-loop service to enable these pages.
-This integrated view does not require access to port 8081 or a running standalone
-oxygen service. Its links, live updates, and plots all use port 8080.
-
 Run the independent helium-line oxygen monitor using the same dependencies:
 
 ```bash
@@ -310,6 +303,7 @@ python o2_level_app.py
 ```
 
 Open `http://localhost:8081` (or replace `localhost` with the server hostname).
+The live display is at `/` and oxygen history is at `/archive` on port 8081.
 The large display calls `read_o2_helium()` from `sensor_poll.py` immediately and
 then every 10 seconds. The last-24-hours database plot refreshes every 30 seconds.
 The Archive button opens an oxygen-only plot with editable start/end times,
