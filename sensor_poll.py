@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
@@ -16,6 +17,7 @@ POLL_PERIOD_SECONDS = 60
 SECONDARY_WATER_LOOP_URL = "http://adm-uc-a.lps.u-psud.fr/data"
 SECONDARY_WATER_LOOP_FLOW_URL = "http://adm-uc-b.lps.u-psud.fr/data"
 PRIMARY_PRESSURE_URL = "http://192.168.142.126:8080"
+O2_HELIUM_URL = "http://129.175.80.156:8080/"
 
 # NiceGUI/FastAPI monitor app POST endpoint.
 MONITOR_APP_POST_URL = "http://127.0.0.1:8080/api/data"
@@ -288,6 +290,72 @@ def read_primary_pressure() -> dict[str, float]:
     raise RuntimeError("'Pressure:' not found in sensor response")
 
 
+def read_o2_helium() -> dict[str, str]:
+    """Read the oxygen level in ppm from the monitor's HTML value div."""
+    class OxygenValueParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.div_depth = 0
+            self.found = False
+            self.parts = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "div":
+                if self.div_depth:
+                    self.div_depth += 1
+                elif not self.found and "value" in (dict(attrs).get("class") or "").split():
+                    self.found = True
+                    self.div_depth = 1
+
+        def handle_endtag(self, tag):
+            if tag == "div" and self.div_depth:
+                self.div_depth -= 1
+
+        def handle_data(self, data):
+            if self.div_depth:
+                self.parts.append(data)
+
+    http_request = urlrequest.Request(
+        O2_HELIUM_URL,
+        headers={
+            "User-Agent": "WaterLoopMonitor/1.0",
+            "Connection": "close",
+        },
+    )
+
+    try:
+        with urlrequest.urlopen(http_request, timeout=5) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"HTTP error while reading oxygen level in He line: {exc.code} {exc.reason}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"Network error while reading oxygen level in He line: {exc.reason}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Error while reading oxygen level in He line: {exc}") from exc
+
+    parser = OxygenValueParser()
+    parser.feed(response_text)
+    parser.close()
+    if not parser.found:
+        raise RuntimeError('Oxygen value div (class="value") not found in sensor response')
+
+    value_text = "".join(parser.parts).strip()
+    if not value_text.endswith("ppm"):
+        raise RuntimeError(f"Expected oxygen level in ppm: {value_text!r}")
+    try:
+        value = float(value_text[:-3].strip().replace(",", "."))
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid oxygen level: {value_text!r}") from exc
+    if not math.isfinite(value):
+        raise RuntimeError(f"Non-finite oxygen level: {value_text!r}")
+
+    return {"o2_helium": f"{value:.2f}"}
+
+
 async def read_opcua_nodes_once(
     client: Client,
     nodes: dict[str, dict[str, object]],
@@ -444,6 +512,13 @@ def collect_measurements() -> dict[str, str]:
     except Exception as exc:
         print(f"HTTP polling error: {exc}")
 
+    # Read oxygen level in He line
+    try:
+        values.update(read_o2_helium())
+    except Exception as exc:
+        print(f"HTTP polling error: {exc}")
+
+    # Read GTB data 
     try:
         opcua_values = asyncio.run(read_opcua_measurements())
         values.update(opcua_values)

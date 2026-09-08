@@ -66,6 +66,12 @@ external_temperature_1 = sensors.FloatSensor(
     {"en": "External Temperature", "fr": "Température extérieure"},
     "°C",)
 
+# Oxygen level in He line
+o2_helium = sensors.FloatSensor(
+    {"en": "Oxygen Level in He Line", "fr": "Teneur en oxygène dans la ligne He"},
+    "ppm",
+    )
+
 SIGNAL_TABLE = {
     "primary_pressure_1": primary_pressure_1,
     "primary_temperature_1": primary_temperature_1,
@@ -79,5 +85,6 @@ SIGNAL_TABLE = {
     "gf01_state": gf01_state,
     "gf02_state": gf02_state,
     "valve_command": valve_command,
-    "external_temperature_1" : external_temperature_1
+    "external_temperature_1" : external_temperature_1,
+    "o2_helium": o2_helium,
 }
