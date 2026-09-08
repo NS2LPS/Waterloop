@@ -9,6 +9,7 @@ WATERLOOP_O2_PLOT_PERIOD_SECONDS (30), WATERLOOP_O2_PORT (8081).
 import logging
 import math
 from contextlib import closing
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -48,6 +49,41 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+@dataclass
+class PlotView:
+    """Keep each browser's selected ranges across NiceGUI figure replacements."""
+
+    ranges: dict[str, list] = field(default_factory=dict)
+    window: tuple[int, int] | None = None
+    revision: int = 0
+
+    def capture(self, event) -> None:
+        payload = event.args
+        if isinstance(payload, list) and payload:
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            return
+        for axis in ("xaxis", "yaxis"):
+            if payload.get(f"{axis}.autorange") is True:
+                self.ranges.pop(axis, None)
+                continue
+            bounds = payload.get(f"{axis}.range")
+            if bounds is None and all(f"{axis}.range[{i}]" in payload for i in (0, 1)):
+                bounds = [payload[f"{axis}.range[0]"], payload[f"{axis}.range[1]"]]
+            if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+                self.ranges[axis] = list(bounds)
+
+    def apply(self, figure: go.Figure, start: int, end: int, *, live: bool) -> None:
+        if not live and self.window != (start, end):
+            # A new archive selection should show its entire time span.
+            self.ranges.clear()
+            self.window = (start, end)
+            self.revision += 1
+        figure.update_layout(uirevision=f"{figure.layout.uirevision}:{self.revision}")
+        for axis, bounds in self.ranges.items():
+            figure.update_layout({axis: {"range": bounds, "autorange": False}})
 
 
 def history_bucket_seconds(start_timestamp: int, end_timestamp: int) -> int:
@@ -141,7 +177,9 @@ def make_figure(timestamps: list, values: list, start: int, end: int, *, live: b
     return figure
 
 
-async def update_history(plot, status, start: int, end: int, *, live: bool = False) -> None:
+async def update_history(
+    plot, status, start: int, end: int, *, live: bool = False, view: PlotView | None = None,
+) -> None:
     status.set_text("Loading readings…")
     try:
         timestamps, values, bucket = await run.io_bound(read_history, start, end)
@@ -149,7 +187,11 @@ async def update_history(plot, status, start: int, end: int, *, live: bool = Fal
         logger.exception("Could not read oxygen history")
         status.set_text("Unable to load database readings. Any displayed plot is from the previous refresh.")
         return
-    plot.figure = make_figure(timestamps, values, start, end, live=live)
+    figure = make_figure(timestamps, values, start, end, live=live)
+    if view is not None:
+        # Read the current view after the query: the user may zoom while it runs.
+        view.apply(figure, start, end, live=live)
+    plot.figure = figure
     plot.update()
     if not any(value is not None for value in values):
         status.set_text("No oxygen readings stored for this time span.")
@@ -161,6 +203,7 @@ async def update_history(plot, status, start: int, end: int, *, live: bool = Fal
 
 @ui.page("/")
 def main_page() -> None:
+    view = PlotView()
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-6"):
         ui.label("Oxygen level in the helium line").classes("text-3xl font-semibold")
         with ui.card().classes("w-full items-center p-8"):
@@ -180,6 +223,7 @@ def main_page() -> None:
             ui.label("Last 24 hours").classes("text-xl font-semibold")
             now = int(datetime.now(LOCAL_TZ).timestamp())
             plot = ui.plotly(make_figure([], [], now - 86400, now, live=True)).classes("w-full")
+            plot.on("plotly_relayout", view.capture)
             history_status = ui.label("Loading readings…").classes("text-sm text-slate-500")
         ui.button("Archive", icon="history", on_click=lambda: ui.navigate.to("/archive"))
 
@@ -199,7 +243,7 @@ def main_page() -> None:
 
     async def refresh_history() -> None:
         end = int(datetime.now(LOCAL_TZ).timestamp())
-        await update_history(plot, history_status, end - 86400, end, live=True)
+        await update_history(plot, history_status, end - 86400, end, live=True, view=view)
 
     # Async callbacks move HTTP and MySQL work off the UI event loop.
     ui.timer(settings.o2_poll_period_seconds, refresh_live, immediate=True)
@@ -220,6 +264,7 @@ def parse_archive_window(start_text: str, end_text: str) -> tuple[int, int]:
 def archive_page() -> None:
     now = datetime.now(LOCAL_TZ).replace(second=0, microsecond=0)
     week_ago = now - timedelta(days=7)
+    view = PlotView(window=(int(week_ago.timestamp()), int(now.timestamp())))
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
         ui.button("Live display", icon="arrow_back", on_click=lambda: ui.navigate.to("/")).props("flat")
         ui.label("Oxygen history").classes("text-3xl font-semibold")
@@ -229,6 +274,7 @@ def archive_page() -> None:
             end_input = ui.input("To (Europe/Paris)", value=now.isoformat(timespec="minutes")[:16]).props("type=datetime-local")
             show_button = ui.button("Show data")
         plot = ui.plotly(make_figure([], [], int(week_ago.timestamp()), int(now.timestamp()))).classes("w-full")
+        plot.on("plotly_relayout", view.capture)
         status = ui.label("Loading readings…").classes("text-sm text-slate-500")
         ui.label("Longer time spans use wider averages, up to 2,000 plotted points.").classes("text-sm text-slate-400")
 
@@ -240,7 +286,7 @@ def archive_page() -> None:
             return
         show_button.disable()
         try:
-            await update_history(plot, status, start, end)
+            await update_history(plot, status, start, end, view=view)
         finally:
             show_button.enable()
 
