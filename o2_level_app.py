@@ -147,7 +147,6 @@ async def update_history(plot, status, start: int, end: int) -> None:
         status.set_text("No oxygen readings stored for this time span.")
     else:
         status.set_text(
-            f"{bucket / 60:g}-minute averages · "
             f"Updated {datetime.now(LOCAL_TZ):%H:%M:%S}"
         )
 
