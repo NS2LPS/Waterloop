@@ -294,6 +294,38 @@ ui.run(
 
 For HTTPS, the recommended deployment is to run NiceGUI on `127.0.0.1:8080` and put Caddy or Nginx in front of it to terminate TLS.
 
+## Standalone oxygen display
+
+Run the independent helium-line oxygen monitor using the same dependencies:
+
+```bash
+python o2_level_app.py
+```
+
+Open `http://localhost:8081` (or replace `localhost` with the server hostname).
+The large display calls `read_o2_helium()` from `sensor_poll.py` immediately and
+then every 10 seconds. The last-24-hours database plot refreshes every 30 seconds.
+The Archive button opens an oxygen-only plot with editable start/end times,
+initially covering the last seven days. Times are displayed in Europe/Paris.
+
+Database credentials use the same `WATERLOOP_DB_HOST`, `WATERLOOP_DB_PORT`,
+`WATERLOOP_DB_USER`, `WATERLOOP_DB_PASSWORD`, and `WATERLOOP_DB_NAME` settings and
+adjacent `.env` file as `waterloop_app.py`. Environment variables take precedence.
+Both plots combine `monitored_data` and `monitored_data_archive`, averaging values
+in MySQL into at most 2,000 points. Missing time buckets appear as gaps.
+
+The app only reads data. Keep `sensor_poll.py` and the monitor API running to
+continue storing `o2_helium` history; the 10-second display polling does not insert
+additional measurements. The existing database and both history tables must exist.
+
+Optional `.env` settings:
+
+```bash
+WATERLOOP_O2_POLL_PERIOD_SECONDS=10
+WATERLOOP_O2_PLOT_PERIOD_SECONDS=30
+WATERLOOP_O2_PORT=8081
+```
+
 ## Data ingestion API
 
 Sensor readings are posted to:
