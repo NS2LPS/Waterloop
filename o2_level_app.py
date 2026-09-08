@@ -9,7 +9,7 @@ WATERLOOP_O2_PLOT_PERIOD_SECONDS (30), WATERLOOP_O2_PORT (8081).
 import logging
 import math
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -113,7 +113,18 @@ def read_history(start_timestamp: int, end_timestamp: int) -> tuple[list, list, 
     return timestamps, [values.get(index) for index in range(count)], bucket_seconds
 
 
-def make_figure(timestamps: list, values: list, start: int, end: int) -> go.Figure:
+def make_figure(timestamps: list, values: list, start: int, end: int, *, live: bool = False) -> go.Figure:
+    time_range = [datetime.fromtimestamp(start, tz=LOCAL_TZ),
+                  datetime.fromtimestamp(end, tz=LOCAL_TZ)]
+    # Plotly date-axis bounds use milliseconds for the displayed local wall time.
+    auto_bounds = [date.replace(tzinfo=timezone.utc).timestamp() * 1000 for date in time_range]
+    xaxis = {
+        "title": "Time (Europe/Paris)", "tickformat": "%d %b<br>%H:%M", "type": "date",
+        # Explicit ranges override user zoom during figure replacement.
+        # These bounds apply only while autorange is enabled.
+        "autorange": True,
+        "autorangeoptions": {"minallowed": auto_bounds[0], "maxallowed": auto_bounds[1]},
+    }
     figure = go.Figure(go.Scatter(
         x=timestamps, y=values, mode="lines+markers", connectgaps=False,
         line={"color": "#0891b2", "width": 2}, marker={"size": 3},
@@ -122,17 +133,15 @@ def make_figure(timestamps: list, values: list, start: int, end: int) -> go.Figu
     figure.update_layout(
         template="plotly_white", height=400,
         margin={"l": 65, "r": 20, "t": 20, "b": 60}, showlegend=False,
-        xaxis={
-            "title": "Time (Europe/Paris)", "tickformat": "%d %b<br>%H:%M",
-            "range": [datetime.fromtimestamp(start, tz=LOCAL_TZ),
-                      datetime.fromtimestamp(end, tz=LOCAL_TZ)],
-        },
+        xaxis=xaxis,
         yaxis={"title": "Oxygen level (ppm)", "rangemode": "tozero"},
+        # Preserve both axes on refresh; a new archive window resets the view.
+        uirevision="o2-live" if live else f"o2-archive:{start}:{end}",
     )
     return figure
 
 
-async def update_history(plot, status, start: int, end: int) -> None:
+async def update_history(plot, status, start: int, end: int, *, live: bool = False) -> None:
     status.set_text("Loading readings…")
     try:
         timestamps, values, bucket = await run.io_bound(read_history, start, end)
@@ -140,7 +149,7 @@ async def update_history(plot, status, start: int, end: int) -> None:
         logger.exception("Could not read oxygen history")
         status.set_text("Unable to load database readings. Any displayed plot is from the previous refresh.")
         return
-    plot.figure = make_figure(timestamps, values, start, end)
+    plot.figure = make_figure(timestamps, values, start, end, live=live)
     plot.update()
     if not any(value is not None for value in values):
         status.set_text("No oxygen readings stored for this time span.")
@@ -170,7 +179,7 @@ def main_page() -> None:
         with ui.card().classes("w-full p-4"):
             ui.label("Last 24 hours").classes("text-xl font-semibold")
             now = int(datetime.now(LOCAL_TZ).timestamp())
-            plot = ui.plotly(make_figure([], [], now - 86400, now)).classes("w-full")
+            plot = ui.plotly(make_figure([], [], now - 86400, now, live=True)).classes("w-full")
             history_status = ui.label("Loading readings…").classes("text-sm text-slate-500")
         ui.button("Archive", icon="history", on_click=lambda: ui.navigate.to("/archive"))
 
@@ -190,7 +199,7 @@ def main_page() -> None:
 
     async def refresh_history() -> None:
         end = int(datetime.now(LOCAL_TZ).timestamp())
-        await update_history(plot, history_status, end - 86400, end)
+        await update_history(plot, history_status, end - 86400, end, live=True)
 
     # Async callbacks move HTTP and MySQL work off the UI event loop.
     ui.timer(settings.o2_poll_period_seconds, refresh_live, immediate=True)
