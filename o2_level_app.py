@@ -8,6 +8,7 @@ WATERLOOP_O2_PLOT_PERIOD_SECONDS (30), WATERLOOP_O2_PORT (8081).
 
 import logging
 import math
+import json
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -177,6 +178,42 @@ def make_figure(timestamps: list, values: list, start: int, end: int, *, live: b
     return figure
 
 
+async def update_live_plot(plot, timestamps: list, values: list, start: int, end: int) -> None:
+    """Update the main-page trace in place, using the browser's current zoom."""
+    bounds = [datetime.fromtimestamp(t, tz=LOCAL_TZ).replace(tzinfo=timezone.utc).timestamp() * 1000
+              for t in (start, end)]
+    payload = json.dumps({
+        "x": [timestamp.isoformat() for timestamp in timestamps],
+        "y": values,
+        "bounds": bounds,
+    }, allow_nan=False)
+    await plot.client.run_javascript(f"""
+        const data = {payload};
+        // The first timer may run before NiceGUI has loaded Plotly.
+        let component, graph, library;
+        for (let attempt = 0; attempt < 50; attempt++) {{
+            component = getElement({plot.id});
+            graph = component?.$el;
+            library = component?.Plotly || window.Plotly;
+            if (library && graph?.data && graph?.layout) break;
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }}
+        if (!library || !graph?.data || !graph?.layout) {{
+            throw new Error('Oxygen plot is not ready');
+        }}
+        const layout = {{}};
+        // Only move the 24-hour window when the user has not zoomed or panned.
+        // Never send replacement ranges for either zoomed axis.
+        if (graph.layout.xaxis.autorange !== false) {{
+            layout['xaxis.autorangeoptions.minallowed'] = data.bounds[0];
+            layout['xaxis.autorangeoptions.maxallowed'] = data.bounds[1];
+            layout['xaxis.autorange'] = true;
+        }}
+        await library.update(graph, {{x: [data.x], y: [data.y]}}, layout, [0]);
+        return true;
+    """, timeout=10)
+
+
 async def update_history(
     plot, status, start: int, end: int, *, live: bool = False, view: PlotView | None = None,
 ) -> None:
@@ -187,12 +224,19 @@ async def update_history(
         logger.exception("Could not read oxygen history")
         status.set_text("Unable to load database readings. Any displayed plot is from the previous refresh.")
         return
-    figure = make_figure(timestamps, values, start, end, live=live)
-    if view is not None:
-        # Read the current view after the query: the user may zoom while it runs.
-        view.apply(figure, start, end, live=live)
-    plot.figure = figure
-    plot.update()
+    if live:
+        try:
+            await update_live_plot(plot, timestamps, values, start, end)
+        except Exception:
+            logger.exception("Could not update the live oxygen plot")
+            status.set_text("Unable to refresh the plot. Retrying automatically.")
+            return
+    else:
+        figure = make_figure(timestamps, values, start, end)
+        if view is not None:
+            view.apply(figure, start, end, live=False)
+        plot.figure = figure
+        plot.update()
     if not any(value is not None for value in values):
         status.set_text("No oxygen readings stored for this time span.")
     else:
@@ -203,7 +247,6 @@ async def update_history(
 
 @ui.page("/")
 def main_page() -> None:
-    view = PlotView()
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-6"):
         ui.label("Oxygen level in the helium line").classes("text-3xl font-semibold")
         with ui.card().classes("w-full items-center p-8"):
@@ -223,7 +266,6 @@ def main_page() -> None:
             ui.label("Last 24 hours").classes("text-xl font-semibold")
             now = int(datetime.now(LOCAL_TZ).timestamp())
             plot = ui.plotly(make_figure([], [], now - 86400, now, live=True)).classes("w-full")
-            plot.on("plotly_relayout", view.capture)
             history_status = ui.label("Loading readings…").classes("text-sm text-slate-500")
         ui.button("Archive", icon="history", on_click=lambda: ui.navigate.to("/archive"))
 
@@ -243,7 +285,7 @@ def main_page() -> None:
 
     async def refresh_history() -> None:
         end = int(datetime.now(LOCAL_TZ).timestamp())
-        await update_history(plot, history_status, end - 86400, end, live=True, view=view)
+        await update_history(plot, history_status, end - 86400, end, live=True)
 
     # Async callbacks move HTTP and MySQL work off the UI event loop.
     ui.timer(settings.o2_poll_period_seconds, refresh_live, immediate=True)
