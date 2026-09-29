@@ -26,7 +26,7 @@ valve_command = sensors.FloatSensor(
 
 pmp07_state = sensors.IntSensorValidValues(
     {"en": "Primary Pump State", "fr": "Pompe circuit primaire"},
-    [3,],
+    [3,1,],
     )
 
 # Groupes froids
