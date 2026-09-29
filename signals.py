@@ -58,7 +58,7 @@ secondary_temperature_2 = sensors.FloatSensor(
 secondary_flow_1 = sensors.FloatSensorValidRange(
     {"en": "Water Loop Flow", "fr": "Débit boucle d'eau"},
     "L/min",
-    100,None,
+    90,None,
     )
 
 # External Temperature
