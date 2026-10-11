@@ -21,6 +21,10 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from nicegui import ui, app
 
+from archive_plot import (
+    ArchiveRequest, LatestArchiveLoader, MAX_ARCHIVE_PLOTS, load_archive_plot,
+)
+
 # Sensors and signals
 from signals import SIGNAL_TABLE
 
@@ -108,9 +112,6 @@ API_TOKEN = settings.api_token
 # Plots refresh less frequently to avoid unnecessary browser work.
 LED_REFRESH_PERIOD_SECONDS = 5
 PLOT_REFRESH_PERIOD_SECONDS = 30
-ARCHIVE_MISSING_DATA_INTERVAL_SECONDS = 60
-ARCHIVE_MISSING_DATA_GAP_FACTOR = 2
-MAX_ARCHIVE_PLOT_POINTS = 2000
 # If the latest value is older than this, the LED becomes orange.
 STALE_AFTER_SECONDS = 5 * 60
 
@@ -1699,6 +1700,17 @@ def alarms_page(request: Request) -> None:
 # ---------------------------------------------------------------------
 
 
+def archive_db_connection():
+    """Independent, time-bounded reads cannot exhaust the live-data pool."""
+    return mysql.connector.connect(
+        **DATABASE_CONFIG,
+        connection_timeout=5,
+        read_timeout=20,
+        write_timeout=5,
+        autocommit=True,
+    )
+
+
 @ui.page("/archive")
 def archive_page(request: Request) -> None:
     """Archived monitored-data viewer page.
@@ -1706,8 +1718,6 @@ def archive_page(request: Request) -> None:
     English-only page for plotting archived rows from monitored_data_archive.
     """
 
-    ARCHIVE_TABLE = "monitored_data_archive"
-    CURRENT_TABLE = "monitored_data"
     LANGUAGE = "en"
 
     now = datetime.now(tz=LOCAL_TZ)
@@ -1721,7 +1731,6 @@ def archive_page(request: Request) -> None:
         "start_date": default_start.isoformat(),
         "end_date": today.isoformat(),
         "shared_x_range": None,
-        "syncing_x_range": False,
     }
 
     plot_items: list[dict[str, Any]] = []
@@ -1735,21 +1744,12 @@ def archive_page(request: Request) -> None:
             )
         }
 
-    def sensor_unit(sensor_name: str) -> str:
-        """Return the sensor unit when the sensor class defines one."""
-        return str(getattr(SIGNAL_TABLE[sensor_name], "__unit__", "") or "")
-
-    def yaxis_label(sensor_name: str) -> str:
-        description = SIGNAL_TABLE[sensor_name].description(LANGUAGE)
-        unit = sensor_unit(sensor_name)
-        return f"{description} ({unit})" if unit else description
-
     def parse_day_window() -> tuple[Optional[int], Optional[int]]:
         """Convert selected YYYY-MM-DD dates to an inclusive local-day timestamp window."""
         try:
             start_day = datetime.fromisoformat(state["start_date"]).date()
             end_day = datetime.fromisoformat(state["end_date"]).date()
-        except ValueError:
+        except (TypeError, ValueError):
             ui.notify("Invalid date selection", type="negative")
             return None, None
 
@@ -1777,6 +1777,9 @@ def archive_page(request: Request) -> None:
         )
         end_dt = min(end_dt, datetime.now(tz=LOCAL_TZ))
 
+        if end_dt < start_dt:
+            ui.notify("Choose a start date that is not in the future", type="negative")
+            return None, None
         return int(start_dt.timestamp()), int(end_dt.timestamp())
 
     def parse_plotly_timestamp(value: Any) -> Optional[int]:
@@ -1816,6 +1819,8 @@ def archive_page(request: Request) -> None:
         """Return the zoomed timestamp window, falling back to the selected dates."""
         selected_start, selected_end = parse_day_window()
         shared_x_range = state.get("shared_x_range")
+        if selected_start is None or selected_end is None:
+            return None, None
 
         if shared_x_range is None:
             return selected_start, selected_end
@@ -1838,224 +1843,6 @@ def archive_page(request: Request) -> None:
 
         return visible_start, visible_end
 
-    def archive_bucket_seconds(start_timestamp: int, end_timestamp: int) -> int:
-        """Choose zero for raw rows or a SQL aggregation bucket size in seconds."""
-        range_seconds = max(1, end_timestamp - start_timestamp)
-        raw_interval = max(1, ARCHIVE_MISSING_DATA_INTERVAL_SECONDS)
-
-        if range_seconds / raw_interval <= MAX_ARCHIVE_PLOT_POINTS:
-            return 0
-
-        for bucket_seconds in (
-            5 * 60,
-            15 * 60,
-            30 * 60,
-            60 * 60,
-            3 * 60 * 60,
-            6 * 60 * 60,
-            12 * 60 * 60,
-            24 * 60 * 60,
-            7 * 24 * 60 * 60,
-        ):
-            if range_seconds / bucket_seconds <= MAX_ARCHIVE_PLOT_POINTS:
-                return bucket_seconds
-
-        return 30 * 24 * 60 * 60
-
-    def get_archive_sensor_points(
-        sensor_name: str,
-        start_timestamp: int,
-        end_timestamp: int,
-        bucket_seconds: int,
-    ) -> list[tuple[int, float]]:
-        """Fetch raw or SQL-aggregated archived points for one sensor."""
-        points: list[tuple[int, float]] = []
-
-        try:
-            with db_connection() as connection:
-                with closing(connection.cursor()) as cursor:
-                    if bucket_seconds <= 0:
-                        cursor.execute(
-                            f"""
-                            SELECT `timestamp`, value
-                            FROM (
-                                SELECT `timestamp`, value
-                                FROM {ARCHIVE_TABLE}
-                                WHERE sensor = %s
-                                  AND `timestamp` BETWEEN %s AND %s
-
-                                UNION ALL
-
-                                SELECT `timestamp`, value
-                                FROM {CURRENT_TABLE}
-                                WHERE sensor = %s
-                                  AND `timestamp` BETWEEN %s AND %s
-                            ) rows_for_plot
-                            ORDER BY `timestamp`
-                            """,
-                            (
-                                sensor_name,
-                                start_timestamp,
-                                end_timestamp,
-                                sensor_name,
-                                start_timestamp,
-                                end_timestamp,
-                            ),
-                        )
-                    else:
-                        cursor.execute(
-                            f"""
-                            SELECT bucket_timestamp, AVG(numeric_value) AS value
-                            FROM (
-                                SELECT
-                                    FLOOR(`timestamp` / %s) * %s AS bucket_timestamp,
-                                    CAST(value AS DECIMAL(20, 6)) AS numeric_value
-                                FROM {ARCHIVE_TABLE}
-                                WHERE sensor = %s
-                                  AND `timestamp` BETWEEN %s AND %s
-
-                                UNION ALL
-
-                                SELECT
-                                    FLOOR(`timestamp` / %s) * %s AS bucket_timestamp,
-                                    CAST(value AS DECIMAL(20, 6)) AS numeric_value
-                                FROM {CURRENT_TABLE}
-                                WHERE sensor = %s
-                                  AND `timestamp` BETWEEN %s AND %s
-                            ) rows_for_plot
-                            GROUP BY bucket_timestamp
-                            ORDER BY bucket_timestamp
-                            """,
-                            (
-                                bucket_seconds,
-                                bucket_seconds,
-                                sensor_name,
-                                start_timestamp,
-                                end_timestamp,
-                                bucket_seconds,
-                                bucket_seconds,
-                                sensor_name,
-                                start_timestamp,
-                                end_timestamp,
-                            ),
-                        )
-
-                    rows = cursor.fetchall()
-
-        except MySQLError as exc:
-            print(f"Could not fetch archived plot data for {sensor_name!r}: {exc}")
-            return points
-
-        sensor = SIGNAL_TABLE[sensor_name]
-
-        for timestamp, value_str in rows:
-            point_timestamp = int(timestamp)
-            try:
-                points.append((point_timestamp, sensor.value(value_str)))
-            except Exception as exc:
-                print(
-                    f"Using NaN for invalid archived row sensor={sensor_name!r}, "
-                    f"timestamp={timestamp!r}, value={value_str!r}: {exc}"
-                )
-                points.append((point_timestamp, math.nan))
-
-        return points
-
-    def fill_missing_archive_points(
-        points: list[tuple[int, float]],
-        expected_delta: int,
-    ) -> list[tuple[int, float]]:
-        """Insert NaN samples where a regular archive series has missing rows."""
-        if len(points) < 2:
-            return sorted(points)
-
-        sorted_points = sorted(points)
-        if expected_delta <= 0:
-            return sorted_points
-
-        gap_threshold = expected_delta * ARCHIVE_MISSING_DATA_GAP_FACTOR
-        filled_points: list[tuple[int, float]] = [sorted_points[0]]
-
-        for previous_point, current_point in zip(sorted_points, sorted_points[1:]):
-            previous_timestamp = previous_point[0]
-            current_timestamp = current_point[0]
-            gap = current_timestamp - previous_timestamp
-
-            if gap > gap_threshold:
-                missing_timestamp = previous_timestamp + expected_delta
-                while missing_timestamp < current_timestamp:
-                    filled_points.append((missing_timestamp, math.nan))
-                    missing_timestamp += expected_delta
-
-            filled_points.append(current_point)
-
-        return filled_points
-
-    def make_archive_figure(sensor_name: str) -> go.Figure:
-        """Build one archived signal Plotly figure."""
-        selected_start, selected_end = parse_day_window()
-        start_timestamp, end_timestamp = visible_timestamp_window()
-
-        figure = go.Figure()
-        bucket_seconds = 0
-
-        if start_timestamp is None or end_timestamp is None:
-            points = []
-        else:
-            bucket_seconds = archive_bucket_seconds(start_timestamp, end_timestamp)
-            points = get_archive_sensor_points(
-                sensor_name=sensor_name,
-                start_timestamp=start_timestamp,
-                end_timestamp=end_timestamp,
-                bucket_seconds=bucket_seconds,
-            )
-            points = fill_missing_archive_points(
-                points,
-                expected_delta=bucket_seconds or ARCHIVE_MISSING_DATA_INTERVAL_SECONDS,
-            )
-
-        x_values = [
-            datetime.fromtimestamp(timestamp, tz=LOCAL_TZ)
-            for timestamp, _ in points
-        ]
-        y_values = [value for _, value in points]
-
-        figure.add_trace(
-            go.Scatter(
-                x=x_values,
-                y=y_values,
-                mode="lines",
-                connectgaps=False,
-                hovertemplate="%{x|%Y-%m-%d %H:%M:%S}<br>%{y}<extra></extra>",
-            )
-        )
-
-        xaxis_options: dict[str, Any] = {
-            "tickformat": "%Y-%m-%d<br>%H:%M",
-            "hoverformat": "%Y-%m-%d %H:%M:%S",
-        }
-        shared_x_range = state.get("shared_x_range")
-        if shared_x_range is not None:
-            xaxis_options["range"] = shared_x_range
-        elif selected_start is not None and selected_end is not None:
-            xaxis_options["range"] = [
-                datetime.fromtimestamp(selected_start, tz=LOCAL_TZ),
-                datetime.fromtimestamp(selected_end, tz=LOCAL_TZ),
-            ]
-
-        figure.update_layout(
-            title=SIGNAL_TABLE[sensor_name].description(LANGUAGE),
-            xaxis_title="Time",
-            yaxis_title=yaxis_label(sensor_name),
-            margin={"l": 60, "r": 20, "t": 50, "b": 50},
-            showlegend=False,
-            xaxis=xaxis_options,
-            template="plotly_white",
-            height=360,
-        )
-
-        return figure
-
     def relayout_payload(event: Any) -> dict[str, Any]:
         """Return Plotly relayout data from NiceGUI event arguments."""
         args = getattr(event, "args", {})
@@ -2066,14 +1853,38 @@ def archive_page(request: Request) -> None:
         return {}
 
     def refresh_plot(plot_state: dict[str, Any]) -> None:
-        sensor_name = str(plot_state["select"].value)
-        plot_state["figure"].figure = make_archive_figure(sensor_name)
-        plot_state["figure"].update()
+        start, end = visible_timestamp_window()
+        if start is None or end is None:
+            # Invalidate any in-flight result when the selection is invalid.
+            plot_state["loader"].invalidate()
+            plot_state["status"].set_text("Choose a valid date range, then refresh.")
+            return
+        plot_state["status"].set_text("Loading readings… You can keep using this page.")
+        plot_state["loader"].submit(ArchiveRequest(str(plot_state["select"].value), start, end))
+
+    def create_loader(plot_state: dict[str, Any]) -> LatestArchiveLoader:
+        def apply_result(result):
+            if plot_state["card"].is_deleted:
+                return
+            figure, status = result
+            plot_state["figure"].figure = figure
+            plot_state["figure"].update()
+            plot_state["status"].set_text(status)
+
+        def show_error(_exc):
+            if not plot_state["card"].is_deleted:
+                plot_state["status"].set_text(
+                    "Unable to load this time span. Try Refresh or a smaller range. "
+                    "Any displayed plot is from the previous request."
+                )
+
+        return LatestArchiveLoader(
+            lambda request: load_archive_plot(archive_db_connection, request, SIGNAL_TABLE[request.sensor]),
+            apply_result,
+            show_error,
+        )
 
     def sync_x_range_from_plot(event: Any, source_plot: dict[str, Any]) -> None:
-        if state["syncing_x_range"]:
-            return
-
         payload = relayout_payload(event)
         next_range = state.get("shared_x_range")
 
@@ -2086,16 +1897,23 @@ def archive_page(request: Request) -> None:
         else:
             return
 
-        if next_range == state.get("shared_x_range"):
+        if next_range is not None:
+            if len(next_range) != 2:
+                return
+            bounds = [parse_plotly_timestamp(value) for value in next_range]
+            if any(value is None for value in bounds) or bounds[0] >= bounds[1]:
+                return
+            # Plotly echoes programmatic ranges in a different string format.
+            # Compare timestamps to avoid refresh loops across synchronized plots.
+            current = visible_timestamp_window()
+            if tuple(bounds) == current:
+                return
+        elif state.get("shared_x_range") is None:
             return
 
         state["shared_x_range"] = next_range
-        state["syncing_x_range"] = True
-        try:
-            for plot_state in list(plot_items):
-                refresh_plot(plot_state)
-        finally:
-            state["syncing_x_range"] = False
+        for plot_state in list(plot_items):
+            refresh_plot(plot_state)
 
     def refresh_all_plots() -> None:
         state["start_date"] = str(start_date_input.value)
@@ -2106,12 +1924,16 @@ def archive_page(request: Request) -> None:
             refresh_plot(plot_state)
 
     def remove_plot(plot_state: dict[str, Any]) -> None:
+        plot_state["loader"].close()
         if plot_state in plot_items:
             plot_items.remove(plot_state)
 
         plot_state["card"].delete()
 
     def add_plot() -> None:
+        if len(plot_items) >= MAX_ARCHIVE_PLOTS:
+            ui.notify(f"You can display up to {MAX_ARCHIVE_PLOTS} plots at a time.", type="warning")
+            return
         options = signal_options()
         default_sensor = next(iter(options.keys()))
 
@@ -2133,17 +1955,18 @@ def archive_page(request: Request) -> None:
                         color="negative",
                     ).props("outline")
 
-                plot_widget = ui.plotly(
-                    make_archive_figure(default_sensor)
-                ).classes("w-full")
+                status_label = ui.label("Loading readings…").classes("text-sm text-gray-600")
+                plot_widget = ui.plotly({"data": [], "layout": {"height": 360}}).classes("w-full")
 
             plot_state.update(
                 {
                     "card": card,
                     "select": signal_select,
                     "figure": plot_widget,
+                    "status": status_label,
                 }
             )
+            plot_state["loader"] = create_loader(plot_state)
 
             signal_select.on(
                 "update:model-value",
@@ -2156,6 +1979,13 @@ def archive_page(request: Request) -> None:
             remove_button.on_click(lambda item=plot_state: remove_plot(item))
 
             plot_items.append(plot_state)
+            refresh_plot(plot_state)
+
+    def close_loaders():
+        for plot_state in plot_items:
+            plot_state["loader"].close()
+
+    ui.context.client.on_delete(close_loaders)
 
     with ui.column().classes("w-full p-4 gap-4"):
         with ui.row().classes("w-full items-center justify-between"):

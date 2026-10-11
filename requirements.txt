@@ -5,6 +5,6 @@ fastapi
 uvicorn
 requests
 asyncua
-mysql-connector-python
+mysql-connector-python>=9.2
 pydantic-settings
 python-dotenv

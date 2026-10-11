@@ -294,6 +294,54 @@ ui.run(
 
 For HTTPS, the recommended deployment is to run NiceGUI on `127.0.0.1:8080` and put Caddy or Nginx in front of it to terminate TLS.
 
+## Archive plots and long time ranges
+
+The main application's `/archive` page combines live and archived measurements.
+Choose dates, click **Refresh**, and use **Add plot** to compare up to eight
+signals. Zooming one plot updates the others and retrieves finer-resolution data;
+resetting the x axis restores the selected dates.
+
+Archive SQL and figure preparation run in worker threads, so database latency
+cannot block NiceGUI's WebSocket heartbeats. At most two archive loads execute
+at once across all clients, using connections separate from the live-data pool.
+Each plot keeps only its latest pending selection; obsolete results are ignored,
+and removing a plot or closing its page discards pending work.
+
+Each trace contains at most 2,000 points, including missing-data separators.
+Short windows preserve raw samples when they fit the budget. Dense short
+windows are automatically retried with SQL aggregation. Long windows use
+start-aligned time buckets, with each table aggregated before combining weighted
+averages. A single gap marker breaks the line during an outage. The status below
+each selector reports loading, averaging, no data, or a failed read; failures
+retain the previous plot and can be retried with **Refresh**.
+
+Archive reads have a 5-second connection timeout, a 20-second socket read timeout,
+a 5-second write timeout, and a MySQL `MAX_EXECUTION_TIME(15000)` hint per SELECT.
+The connector timeouts require `mysql-connector-python>=9.2`; update the installed
+dependencies before restarting an older deployment. MySQL versions that honor
+this hint stop an overlong read after 15 seconds. These limits leave the UI
+responsive and produce a recoverable error when a window is too expensive.
+The existing `(sensor, timestamp, id)` indexes in both tables support range reads;
+large historical scans can still hit the limit on a slow database.
+
+The `archive_plot` logger records failures with sensor, requested time range and
+elapsed time. At INFO level it also records bucket size and returned point count.
+Enable INFO logging for this logger in the deployment's logging configuration to
+compare query/plot durations with any browser reconnect events. No database
+credentials or individual sensor values are included in these diagnostic fields.
+
+Run the archive regression tests from the project directory:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests use simulated slow/erroring database calls and a SQL aggregation
+fixture; they do not contact the production database. They cover event-loop
+responsiveness, query/payload bounds, aggregation across both tables, stale-result
+suppression, request concurrency, removal, errors/retries, and real NiceGUI
+controls for date changes and synchronized zoom.
+
 ## Standalone oxygen display
 
 Run the independent helium-line oxygen monitor using the same dependencies:
