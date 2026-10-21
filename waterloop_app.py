@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     alarms_retention_days: int = 365
     alarm_holdoff_minutes: int = 10
     alarm_min_consecutive_out_of_bounds: int = 2
+    alarm_recovery_minutes: int = Field(default=10, ge=0)
     archive_rollover_period_seconds: int = 6 * 3600
     archive_batch_size: int = 10_000
 
@@ -211,11 +212,15 @@ MONITORED_DATA_LIVE_RETENTION_DAYS = settings.monitored_data_retention_days
 ALARMS_LIVE_RETENTION_DAYS = settings.alarms_retention_days
 ALARM_HOLDOFF_SECONDS = max(0, settings.alarm_holdoff_minutes) * 60
 ALARM_MIN_CONSECUTIVE_OUT_OF_BOUNDS = max(1, settings.alarm_min_consecutive_out_of_bounds)
+ALARM_RECOVERY_SECONDS = settings.alarm_recovery_minutes * 60
+ALARM_RECOVERY_CHECK_SECONDS = 10
 ARCHIVE_ROLLOVER_PERIOD_SECONDS = settings.archive_rollover_period_seconds
 ARCHIVE_BATCH_SIZE = settings.archive_batch_size
 
 _archive_rollover_lock = threading.Lock()
 _last_archive_rollover_timestamp = 0
+_alarm_recovery_stop = threading.Event()
+_alarm_recovery_thread: Optional[threading.Thread] = None
 
 def quote_mysql_identifier(identifier: str) -> str:
     """Safely quote a MySQL identifier such as a database name."""
@@ -340,6 +345,24 @@ def create_tables_if_needed() -> None:
                 ) ENGINE=InnoDB
                   DEFAULT CHARSET=utf8mb4
                   COLLATE=utf8mb4_unicode_ci
+                """
+            )
+
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alarm_notification_state (
+                    id TINYINT NOT NULL PRIMARY KEY,
+                    pending TINYINT NOT NULL DEFAULT 0,
+                    normal_since BIGINT NULL
+                ) ENGINE=InnoDB
+                  DEFAULT CHARSET=utf8mb4
+                  COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cursor.execute(
+                """
+                INSERT IGNORE INTO alarm_notification_state (id, pending, normal_since)
+                VALUES (1, 0, NULL)
                 """
             )
 
@@ -592,36 +615,149 @@ def check_api_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
 
-def send_alarm_notification(sensor: str, value_str: str, timestamp: int, transition: int) -> None:
-    """Send an ntfy notification for a new alarm without blocking the API call."""
+def send_ntfy_notification(message: str, title: str, priority: str, tags: str) -> bool:
+    """Return true only when ntfy accepts the notification."""
     if NTFY_TOPIC is None:
-        return
-    if transition==0:
-        return
-
-    sensor = SIGNAL_TABLE[sensor]
-    msg = sensor.alarm_msg(transition,"fr")
-    alarm_time = format_local_time(timestamp,"fr")
-    value = sensor.value(value_str)
-    value_formatted = sensor.format(value)
-
-    title = "Alarme boucle d'eau"
-    message = f"{msg} ({value_formatted}) \n {alarm_time}"
+        return False
 
     url = f"{NTFY_SERVER.rstrip('/')}/{NTFY_TOPIC}"
     data = message.encode("utf-8")
     headers = {
         "Title": title,
-        "Priority": NTFY_PRIORITY,
-        "Tags": "warning" if transition else "white_check_mark",
+        "Priority": priority,
+        "Tags": tags,
     }
 
     try:
         req = urlrequest.Request(url, data=data, headers=headers, method="POST")
         with urlrequest.urlopen(req, timeout=5):
             pass
+        return True
     except (HTTPError, URLError, TimeoutError, OSError) as exc:
         print(f"ntfy notification failed for message={message!r}: {exc}")
+        return False
+
+
+def lock_alarm_notification_state(cursor) -> tuple[bool, Optional[int]]:
+    """Serialize recovery checks with readings from every alarm channel."""
+    cursor.execute(
+        """
+        SELECT pending, normal_since
+        FROM alarm_notification_state
+        WHERE id = 1
+        FOR UPDATE
+        """
+    )
+    pending, normal_since = cursor.fetchone()
+    return bool(pending), normal_since
+
+
+def update_alarm_recovery_state(cursor, timestamp: int) -> tuple[bool, Optional[int]]:
+    """Keep the clear interval only while every alarm channel is fresh and normal."""
+    pending, normal_since = lock_alarm_notification_state(cursor)
+    if not pending:
+        return False, None
+
+    placeholders = ", ".join(["%s"] * len(STATUS_LEDS))
+    cursor.execute(
+        f"""
+        SELECT sensor, last_state, last_timestamp
+        FROM sensor_states
+        WHERE sensor IN ({placeholders})
+        """,
+        tuple(STATUS_LEDS),
+    )
+    states = {
+        name: (int(state), int(last_timestamp))
+        for name, state, last_timestamp in cursor.fetchall()
+    }
+    all_normal = bool(STATUS_LEDS) and all(
+        name in states
+        and states[name][0] == 0
+        and 0 <= timestamp - states[name][1] <= STALE_AFTER_SECONDS
+        for name in STATUS_LEDS
+    )
+    next_normal_since = None
+    if all_normal:
+        next_normal_since = timestamp if normal_since is None else normal_since
+    if next_normal_since != normal_since:
+        cursor.execute(
+            "UPDATE alarm_notification_state SET normal_since = %s WHERE id = 1",
+            (next_normal_since,),
+        )
+    return True, next_normal_since
+
+
+def send_alarm_notification(sensor: str, value_str: str, timestamp: int, transition: int) -> None:
+    """Send an active alarm and arm one recovery message after successful delivery."""
+    if NTFY_TOPIC is None or transition == 0:
+        return
+
+    sensor_obj = SIGNAL_TABLE[sensor]
+    msg = sensor_obj.alarm_msg(transition, "fr")
+    alarm_time = format_local_time(timestamp, "fr")
+    value_formatted = sensor_obj.format(sensor_obj.value(value_str))
+    message = f"{msg} ({value_formatted}) \n {alarm_time}"
+    if not send_ntfy_notification(message, "Alarme boucle d'eau", NTFY_PRIORITY, "warning"):
+        return
+
+    try:
+        with db_connection() as connection:
+            with closing(connection.cursor()) as cursor:
+                lock_alarm_notification_state(cursor)
+                cursor.execute("UPDATE alarm_notification_state SET pending = 1 WHERE id = 1")
+                update_alarm_recovery_state(cursor, int(time.time()))
+    except MySQLError as exc:
+        print(f"Could not record pending alarm recovery notification: {exc}")
+
+
+def check_alarm_recovery() -> None:
+    """Send one global recovery notification after the continuous clear interval."""
+    if NTFY_TOPIC is None:
+        return
+
+    with db_connection() as connection:
+        with closing(connection.cursor()) as cursor:
+            timestamp = int(time.time())
+            pending, normal_since = update_alarm_recovery_state(cursor, timestamp)
+            if not pending or normal_since is None or timestamp - normal_since < ALARM_RECOVERY_SECONDS:
+                return
+
+            message = f"Paramètres conformes depuis {settings.alarm_recovery_minutes} minutes."
+              
+            # Keep the row locked until delivery is recorded, preventing duplicates
+            # and a new alarm reading from racing the all-clear notification.
+            if send_ntfy_notification(message, "Retour à la normale", "default", "white_check_mark"):
+                cursor.execute(
+                    "UPDATE alarm_notification_state SET pending = 0, normal_since = NULL WHERE id = 1"
+                )
+
+
+def start_alarm_recovery_monitor() -> None:
+    """Check recovery independently of incoming readings or connected browsers."""
+    global _alarm_recovery_thread
+    if NTFY_TOPIC is None or (_alarm_recovery_thread and _alarm_recovery_thread.is_alive()):
+        return
+
+    _alarm_recovery_stop.clear()
+
+    def worker() -> None:
+        while not _alarm_recovery_stop.wait(ALARM_RECOVERY_CHECK_SECONDS):
+            try:
+                check_alarm_recovery()
+            except Exception as exc:
+                print(f"Alarm recovery check failed: {exc}")
+
+    _alarm_recovery_thread = threading.Thread(target=worker, daemon=True)
+    _alarm_recovery_thread.start()
+
+
+def stop_alarm_recovery_monitor() -> None:
+    """Stop background checks when the application shuts down."""
+    _alarm_recovery_stop.set()
+    if _alarm_recovery_thread is not None:
+        _alarm_recovery_thread.join(timeout=6)
+
 
 def start_alarm_notification_thread(sensor: str, value_str: str, timestamp: int, transition: int) -> None:
     """Start notification sending in a daemon thread to avoid API timeout."""
@@ -720,7 +856,7 @@ def check_for_alarm_in_transaction(
 
     cursor.execute(
         """
-        SELECT last_state
+        SELECT last_state, last_timestamp
         FROM sensor_states
         WHERE sensor = %s
         FOR UPDATE
@@ -729,6 +865,13 @@ def check_for_alarm_in_transaction(
     )
     row = cursor.fetchone()
     previous_state = None if row is None else int(row[0])
+
+    if (
+        is_alarm_sensor and NTFY_TOPIC is not None and row is not None
+        and not 0 <= timestamp - int(row[1]) <= STALE_AFTER_SECONDS
+    ):
+        # A fresh reading must not conceal a gap between recovery checks.
+        cursor.execute("UPDATE alarm_notification_state SET normal_since = NULL WHERE id = 1")
 
     transition: Optional[int] = None
     acknowledged: Optional[int] = None
@@ -816,6 +959,10 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
     try:
         with db_connection() as connection:
             with closing(connection.cursor()) as cursor:
+                tracks_recovery = NTFY_TOPIC is not None and payload.sensor in STATUS_LEDS
+                if tracks_recovery:
+                    # Always take the global lock before individual sensor locks.
+                    lock_alarm_notification_state(cursor)
                 cursor.execute(
                     """
                     INSERT INTO monitored_data (`timestamp`, sensor, value)
@@ -830,6 +977,8 @@ def post_sensor_reading(payload: SensorReadingIn, request: Request) -> dict[str,
                     value_str=payload.value,
                     timestamp=timestamp,
                 )
+                if tracks_recovery:
+                    update_alarm_recovery_state(cursor, timestamp)
 
     except MySQLError as exc:
         raise HTTPException(
@@ -2099,8 +2248,10 @@ def startup() -> None:
     create_tables_if_needed()
     refresh_sensor_description_table()
     archive_old_rows_if_due(force=True)
+    start_alarm_recovery_monitor()
     
 app.on_startup(startup)
+app.on_shutdown(stop_alarm_recovery_monitor)
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(

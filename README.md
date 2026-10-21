@@ -138,8 +138,21 @@ When it is empty or unset, the ingestion endpoint accepts requests without a tok
 | `WATERLOOP_NTFY_SERVER` | `https://ntfy.sh` | ntfy server URL. |
 | `WATERLOOP_NTFY_TOPIC` | empty / unset | ntfy topic. If empty, notifications are disabled. |
 | `WATERLOOP_NTFY_PRIORITY` | `urgent` | ntfy priority header. |
+| `WATERLOOP_ALARM_RECOVERY_MINUTES` | `10` | Continuous time in minutes that every alarm channel must remain normal before sending one global recovery notification. Set to `0` for the next background check. |
 
-When enabled, the app sends a notification for new alarm transitions. The current notification logic skips `transition == 0`, so back-to-normal events are stored in MySQL but are not sent to ntfy.
+When enabled, the app sends a notification for new alarm transitions. Individual back-to-normal events (`transition == 0`) are stored in MySQL but do not send notifications.
+
+After at least one alarm notification has been accepted by ntfy, the app sends one **Back to normal** message on the same topic once every channel in `STATUS_LEDS` has remained normal for `WATERLOOP_ALARM_RECOVERY_MINUTES` (default: 10 minutes). The recovery message uses normal ntfy priority and a check-mark tag. The delay is separate from the per-channel alarm holdoff.
+
+Any out-of-range reading restarts this delay, including readings that do not generate a notification because of holdoff or the consecutive-reading threshold. Missing or stale readings also prevent recovery; every alarm channel must have a normal reading within the last 5 minutes. Background checks run every 10 seconds, independently of browser connections. A failed recovery delivery is retried on subsequent checks. After successful delivery, no further recovery message is sent until another alarm notification succeeds.
+
+For example, to wait 15 minutes after the last channel clears:
+
+```bash
+WATERLOOP_ALARM_RECOVERY_MINUTES=15
+```
+
+The pending recovery and continuous-clear start time are stored in MySQL and survive application restarts. If the readings are stale when the app resumes, the delay restarts after all channels have fresh normal readings.
 
 If alarm messages are sensitive, use a private random topic, restrict access, or self-host ntfy.
 
@@ -221,6 +234,10 @@ Stores the latest known value and state per sensor.
 | `last_value` | `VARCHAR(255) NOT NULL` | Latest raw value. |
 
 For validating sensors, `last_state` is produced by the sensor's `validate()` method. For non-validating sensors, use state `0` by default so the table can also serve as the fast latest-value source for the SVG scheme.
+
+### `alarm_notification_state`
+
+Created automatically at startup. A single row (`id = 1`) stores whether a successfully sent alarm awaits a recovery notification (`pending`) and the start of the continuous all-normal interval (`normal_since`, Unix seconds or `NULL`). The row is locked during alarm-channel updates and recovery checks so all channels share one recovery interval and only one checker sends the recovery message.
 
 ### `monitored_data_archive`
 
